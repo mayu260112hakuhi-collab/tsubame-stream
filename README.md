@@ -4,6 +4,11 @@
 > A lightweight and stability-focused streaming and recording application written in Rust.
 
 ---
+## Download
+
+最新版はこちらからダウンロードできます。  
+[GitHub Releases](https://github.com/mayu260112hakuhi-collab/tsubame-stream/releases)
+---
 
 ## 日本語
 
