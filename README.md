@@ -8,6 +8,7 @@
 
 最新版はこちらからダウンロードできます。  
 [GitHub Releases](https://github.com/mayu260112hakuhi-collab/tsubame-stream/releases)
+
 ---
 
 ## 日本語
@@ -64,6 +65,8 @@ OBS のような多機能さをそのまま追いかけるのではなく、**�
 詳しい使い方はこちらから確認できます。
 
 [燕 / Tsubame 使い方ガイドを見る](https://github.com/mayu260112hakuhi-collab/tsubame-stream/wiki/%E7%87%95---Tsubame-%E4%BD%BF%E3%81%84%E6%96%B9%E3%82%AC%E3%82%A4%E3%83%89)
+[Tsubame-User-Guide]([https://github.com/mayu260112hakuhi-collab/tsubame-stream/wiki/%E7%87%95---Tsubame-%E4%BD%BF%E3%81%84%E6%96%B9%E3%82%AC%E3%82%A4%E3%83%89](https://github.com/mayu260112hakuhi-collab/tsubame-stream/wiki/Tsubame-User-Guide))
+
 ### 現在の開発状況
 
 現在、以下の機能が動作しています。
