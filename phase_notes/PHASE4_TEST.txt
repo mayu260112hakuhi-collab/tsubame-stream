@@ -1,0 +1,21 @@
+Yaoyorozu Stream Phase 4
+
+Goal:
+- Enumerate visible titled Windows windows.
+- Select Desktop or a specific window in the UI.
+- Restart only the capture worker when source changes.
+- Keep bounded/latest-frame preview behavior.
+
+Run:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream
+
+Manual checks:
+1. Click 一覧更新.
+2. Choose Blender / browser / another app from 映像ソース.
+3. Preview should switch from desktop to that window.
+4. Change sources repeatedly; UI should remain responsive.
+5. Select Yaoyorozu Stream itself only if you want the mirror effect.
+6. Minimized/accelerated windows may not render correctly with this initial GDI backend.
+   A future Windows Graphics Capture backend will address GPU-heavy apps more robustly.

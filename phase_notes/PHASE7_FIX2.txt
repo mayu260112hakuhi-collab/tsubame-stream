@@ -1,0 +1,36 @@
+Yaoyorozu Stream Phase 7 Fix 2 — recording speed/timestamp fix
+
+Root cause:
+The old writer encoded "one output frame per WGC callback" while FFmpeg was
+told the stream was fixed 30/60 fps. WGC callback cadence is variable, so a
+10-second real recording could contain far fewer timeline frames and play fast.
+
+Fix:
+- recording video writer now owns a wall-clock fixed-FPS scheduler
+- output frame count = elapsed real time × output fps
+- newest WGC frame is held and duplicated when callbacks are slower
+- excessive callbacks are coalesced into a capacity-1 latest-frame mailbox
+- stop performs a final wall-clock catch-up
+- UI never waits for encoder
+- added deterministic timing tests
+
+Expected:
+10 sec real recording ~= 10 sec MP4
+20 sec real recording ~= 20 sec MP4
+
+Run:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream
+
+Manual timing test:
+1. Start a stopwatch.
+2. Record exactly about 10 seconds.
+3. Stop and wait for 録画完了.
+4. Check recording.mp4 duration.
+5. It should be approximately the stopwatch duration, not accelerated.
+
+If it still drifts, report:
+- stopwatch duration
+- recording.mp4 duration
+- selected preset (1080p60 / 1080p30 / 720p30)

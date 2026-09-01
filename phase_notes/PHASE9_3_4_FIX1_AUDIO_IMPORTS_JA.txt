@@ -1,0 +1,4 @@
+Phase 9.3.4 Fix1
+- Windows PCM/UDP live audio moduleで使用する AudioChannelId と ChannelMixerControl がスコープに入っておらず E0425 が発生していた。
+- windows_pcm モジュールの super import に両型を追加。
+- ライブ音声リアルタイム制御ロジック自体の仕様変更はなし。

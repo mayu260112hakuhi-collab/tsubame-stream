@@ -1,0 +1,24 @@
+Yaoyorozu Stream Phase 9.3.1 - YouTube / Twitch 配信先基盤
+
+追加:
+- 配信先選択: YouTube / Twitch
+- サーバーURL入力欄
+- ストリームキー入力欄（標準ではマスク表示）
+- ストリームキー表示ON/OFF
+- プラットフォーム別bitrate初期値
+  - YouTube: 12000 kbps
+  - Twitch: 6000 kbps
+- RTMP / RTMPS URL + キーが揃ったとき「設定済み」表示
+- 配信先切替時に前サービスのURL/キーを消去し誤送信を防止
+
+重要:
+- このPhaseでは認証情報をファイルへ永続保存しない。
+- YouTubeはLive Control RoomからRTMPS URLとストリームキーを貼る。
+- Twitchは選択したingest serverのRTMP URLとストリームキーを使う。
+- 実際のFFmpegネットワーク送信ワーカーはPhase 9.3.2へ分離。
+- ローカル録画は従来どおり独立し、配信障害を巻き込ませない方針を維持する。
+
+確認:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream

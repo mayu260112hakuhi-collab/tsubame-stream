@@ -1,0 +1,5 @@
+Phase 10.1.2: 最終warning整理
+
+- app.rs で未使用になっていた AUDIO_METER_HEIGHT / AUDIO_METER_WIDTH import を削除。
+- 機能変更なし。
+- 目標: cargo test --workspace / cargo build --release を warning 0 で通す。

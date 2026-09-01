@@ -1,0 +1,11 @@
+[package]
+name = "stream-audio"
+version = "0.6.0"
+edition = "2021"
+
+[dependencies]
+hound = "3.5"
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.24.0"
+sysinfo = "0.38"

@@ -1,0 +1,53 @@
+Yaoyorozu Stream Phase 9.2.4 - 個別WAV / Mixルーティング
+======================================================
+
+追加内容
+- PC音声 / マイク / アプリ音声に「配信Mix」「個別WAV保存」を実装
+- PC音声 / マイクの既存WAVは引き続き48kHz stereo PCM16の原音
+- アプリ音声もWindows process-loopbackから48kHz stereo PCM16 WAVへ録音
+- アプリ音声WAVは application_<channel_id>_<name>.wav 形式
+- Gain / Mute / Masterは個別WAVへ焼き込まず、完成MP4のMix時だけ反映
+- 配信Mix OFFのチャンネルは完成MP4から除外
+- 個別WAV保存 OFFでもMixに必要な原音は内部録音し、完成MP4生成後に削除
+- 全チャンネルが配信Mix OFFの場合は音声なしMP4として完成
+- 1つのアプリ音声録音が失敗/終了してもPC音声・マイク・録画全体を停止しない
+
+UI
+- PC音声: [配信Mix] [個別WAV保存]
+- マイク: [配信Mix] [個別WAV保存]
+- アプリ音声: [配信Mix] [個別WAV保存]
+
+録画処理
+1. 録画開始時に追加済みApplicationチャンネルごとに専用WAV録音スレッド開始
+2. 録画停止時にWAVを閉じる
+3. 現在のGain / Mute / 配信Mix設定からFFmpeg filter_complexを可変生成
+4. video_only.mp4 + Mix参加WAV群 -> recording.mp4
+5. 個別WAV保存OFFの原音WAVを削除
+
+互換性
+- RecordingSession::start / start_with_audio_devices は維持
+- 新規 start_with_audio_routing でChannelMixerControlを受け取る
+- 既存 build_mix_filter もテスト互換のため維持
+
+追加テスト
+- routed_filter_skips_channels_not_in_stream_mix
+- routed_filter_turns_muted_channel_into_zero_gain
+- routed_filter_returns_none_when_every_channel_is_excluded
+- application_track_path_is_stable_and_safe
+
+ユーザー側確認
+    cargo test --workspace
+    cargo check --workspace
+    cargo run -p yaoyorozu-stream
+
+実機確認
+- Discordをアプリ音声へ追加
+- PC音声 / マイク / Discordをすべて個別WAV保存ONで10秒ほど録画
+- microphone.wav / desktop.wav / application_*_discord.wav が作成されること
+- Discordだけ配信Mix OFFにして録画し、完成MP4からDiscord音声だけ消えること
+- Discord個別WAVには元音声が残ること
+- Discord個別WAV保存OFF + 配信Mix ONで録画し、MP4にはDiscordが入りWAVだけ消えること
+- 全チャンネル配信Mix OFFで音声なしMP4が完成すること
+
+注意
+この環境にはCargo/Rustツールチェーンがないため、実コンパイルは未実行。

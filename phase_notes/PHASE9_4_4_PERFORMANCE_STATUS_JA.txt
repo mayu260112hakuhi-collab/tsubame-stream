@@ -1,0 +1,21 @@
+Phase 9.4.4 - パフォーマンス表示
+
+目的:
+- OBSとの実機比較をしやすくするため、Yaoyorozu Stream自身の負荷を常時表示する。
+
+追加:
+- 下部ステータスバーへ CPU 使用率を表示
+- Yaoyorozu StreamプロセスのRAM使用量を表示
+- WGC callbackの実測FPSを表示
+- Preview workerの累積Drop数を表示
+
+表示例:
+CPU 2.1% | RAM 184 MB | 60.0 FPS | Preview Drop 0
+
+注意:
+- CPU/RAMはsysinfoで1秒周期に更新する。
+- FPSはWGC callbackの実測値。配信エンコーダの出力FPSとは別。
+- Preview Dropはプレビューworkerのjob dropであり、YouTube側のnetwork/drop統計ではない。
+- 配信drop / dup / bitrate / speedはFFmpeg統計取得を実装する後続Phaseで追加予定。
+
+Version: yaoyorozu-stream 0.16.2

@@ -1,0 +1,27 @@
+Yaoyorozu Stream Phase 9.2.1 Fix1 - マイクメーター起動修正
+
+症状:
+- マイクメーターが -60 dB のまま
+- Windowsのサウンド設定画面を開くとメーターが動く
+
+原因:
+- 待機中のマイクメーターは IAudioMeterInformation のピーク値だけを参照していた。
+- 一部のUSB音声デバイスでは、Capture Streamが実際に起動していないとendpoint peakが更新されない。
+- Windows設定画面がCapture Streamを起動した時だけ値が更新されていた。
+
+修正:
+- マイクメーター用に軽量WASAPI shared-mode Capture Streamを起動。
+- 48kHz / float / autoconvertで初期化。
+- Event-drivenでCapture Bufferを消費し続ける。
+- endpoint meterはその起動済みstream状態で取得。
+- デバイス変更時はstream停止後、新endpointで再初期化。
+- PC音声メーターは既存のendpoint peak方式を維持。
+
+確認項目:
+1. Windows設定画面を閉じたままアプリ起動。
+2. マイクに声を入れ、メーターが -60dB固定から動くか確認。
+3. マイクデバイスを変更して再接続するか確認。
+4. PC音声メーターが従来通り動くか確認。
+5. cargo test --workspace
+6. cargo check --workspace
+7. cargo run -p yaoyorozu-stream

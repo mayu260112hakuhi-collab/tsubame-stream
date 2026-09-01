@@ -1,0 +1,18 @@
+Yaoyorozu Stream Phase 8 Fix 12.1 — windows-result API repair
+
+Root cause:
+Fix12 used windows::core::Error::from_win32(), but windows-result 0.4.1
+does not provide that constructor.
+
+Repair:
+- replace all from_win32() calls with Error::new(HRESULT(E_FAIL), message)
+- add d3d_none_error() helper
+- no GPU scaling, recording, audio, or preview behavior changed
+
+Run:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream
+
+If the next compiler error is a D3D11 signature/type mismatch, send the
+complete output unchanged.

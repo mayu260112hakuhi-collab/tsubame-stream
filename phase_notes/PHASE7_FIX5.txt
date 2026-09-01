@@ -1,0 +1,36 @@
+Yaoyorozu Stream Phase 7 Fix 5 — smooth 60 FPS capture
+
+Root cause found:
+The WGC worker was hard-coded to 30 FPS:
+    CaptureWorker::start(..., 30)
+while Game preset encoded at 60 FPS.
+Fix 2 correctly preserved real duration by duplicating frames, but that turned
+30 unique capture frames/sec into a nominal 60 FPS file with repeated frames.
+
+Fix:
+- Game 1080p60 -> WGC target 60 FPS
+- Work 1080p30 -> WGC target 30 FPS
+- Light 720p30 -> WGC target 30 FPS
+- Changing preset restarts only CaptureWorker when FPS target changes
+- Source switching preserves current capture FPS target
+- UI shows WGC measured callback FPS
+- Recording UI shows output frame count, duplicate frames, dropped frames
+
+Run:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream
+
+Manual game test:
+1. Choose Game 1080p60.
+2. Select Genshin / ZZZ.
+3. Observe "WGC実取得". It should approach 60 FPS during motion.
+4. Record 10-20 seconds while moving camera continuously.
+5. Observe Dup / Drop during recording.
+6. Playback recording.mp4.
+
+Interpretation:
+- WGC ~60, Dup low -> expected smooth 60 FPS.
+- WGC ~30 -> WGC/OS/game delivery is limiting capture.
+- WGC ~60 but Dup high -> recording/FFmpeg path is limiting.
+- Drop rises rapidly -> FFmpeg/CPU/GPU encoder cannot consume frames fast enough.

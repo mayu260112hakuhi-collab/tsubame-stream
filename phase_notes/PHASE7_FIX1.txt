@@ -1,0 +1,22 @@
+Yaoyorozu Stream Phase 7 Fix 1
+
+Root cause targeted:
+FFmpeg can list NVENC/AMF/QSV in `-encoders` even when that backend cannot
+actually initialize on the current GPU/driver. The child then exits and Rust
+sees Windows error 232 (broken/closed pipe).
+
+Fix:
+1. Probe NVENC -> AMF -> QSV -> libx264 with a real 64x64 one-frame encode.
+2. Select only an encoder that successfully initializes.
+3. When FFmpeg exits, collect stderr and show the real encoder/process error.
+4. Remove two harmless unused-import warnings.
+
+Run:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream
+
+Then:
+- start a 10-20 second recording
+- stop recording
+- if it fails, copy the new "FFmpegエラー:" text exactly

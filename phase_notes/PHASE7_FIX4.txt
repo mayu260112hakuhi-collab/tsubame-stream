@@ -1,0 +1,44 @@
+Yaoyorozu Stream Phase 7 Fix 4 — WASAPI PCM audio repair
+
+Observed:
+- Phase 6 endpoint meters worked.
+- microphone.wav and desktop.wav existed but both were silent.
+- Therefore device discovery worked; PCM acquisition/writing path was the target.
+
+Changes:
+1. Rebuilt PCM capture loop to follow wasapi-rs event-driven capture pattern.
+2. Wait for WASAPI event, then drain every available capture packet.
+3. Mic: Capture endpoint -> Capture direction.
+4. Desktop: Render endpoint -> Capture direction in shared mode.
+   wasapi-rs turns this combination into AUDCLNT_STREAMFLAGS_LOOPBACK.
+5. Request 48 kHz / stereo / float32 from WASAPI with autoconvert.
+6. Convert captured float32 samples to standard PCM16 WAV.
+7. Use endpoint minimum period instead of fixed 20ms.
+8. Drain final packets on stop.
+9. Fail if WASAPI delivered zero PCM samples.
+10. Write microphone.audio.txt and desktop.audio.txt diagnostics:
+    sample count, duration and peak dBFS.
+
+Run:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream
+
+Manual test:
+- Record 10-15 seconds.
+- Speak continuously for several seconds.
+- Keep game/music audio playing.
+- Stop and wait for 録画完了.
+- Play microphone.wav and desktop.wav separately.
+
+Expected session files now include:
+recording.mp4
+video_only.mp4
+microphone.wav
+microphone.audio.txt
+desktop.wav
+desktop.audio.txt
+yaoyorozu_edit.json
+
+If either WAV is still silent, send the corresponding .audio.txt contents.
+The peak_dbfs value will immediately tell us whether WASAPI delivered signal.

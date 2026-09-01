@@ -1,0 +1,32 @@
+Yaoyorozu Stream Phase 7 Fix 3 — FFmpeg automatic discovery
+
+Goal:
+Remove the need to manually modify PowerShell PATH.
+
+Search order:
+1. Windows PATH via where.exe ffmpeg
+2. %LOCALAPPDATA%\Microsoft\WinGet\Packages (recursive search)
+3. C:\ffmpeg\bin\ffmpeg.exe
+4. C:\Program Files\ffmpeg\bin\ffmpeg.exe
+5. C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe
+
+The discovered absolute ffmpeg.exe path is used for:
+- version check
+- H.264 encoder probe
+- recording encoder process
+- final AAC/MP4 mux
+
+The UI now displays:
+FFmpeg: <detected path>
+
+Validation:
+1. Open a NEW PowerShell where `ffmpeg -version` does NOT work.
+2. Do NOT add FFmpeg to PATH.
+3. cargo test --workspace
+4. cargo check --workspace
+5. cargo run -p yaoyorozu-stream
+6. Confirm the right panel shows the WinGet ffmpeg.exe path.
+7. Record 10 seconds.
+8. Confirm recording.mp4 is produced at the correct duration.
+
+This verifies Yaoyorozu Stream can discover FFmpeg independently of shell PATH.

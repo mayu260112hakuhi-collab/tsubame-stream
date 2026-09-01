@@ -1,0 +1,9 @@
+Phase 10.1.1: 残り warning 3件の整理
+
+- app.rs の 0.5 を 0.5_f32 に明示し future-incompatible warning を解消。
+- 未使用の旧横型 paint_audio_meter() を削除。縦型 paint_audio_meter_vertical() は維持。
+- シーン表示用 selectable_label の戻り値を明示的に破棄し unused_must_use を解消。
+- 機能/UI挙動は変更しない。
+
+注意: cargo fmt --all --check は整形されていない既存ファイルがあると差分を表示します。
+適用後は cargo fmt --all を一度実行してから cargo fmt --all --check を実行してください。

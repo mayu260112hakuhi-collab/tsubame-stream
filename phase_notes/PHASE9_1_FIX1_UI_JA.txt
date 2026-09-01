@@ -1,0 +1,29 @@
+Yaoyorozu Stream Phase 9.1 Fix1
+
+変更:
+1. 映像ソース
+   - 右パネル幅を長いwindow名で押し広げない
+   - 表示幅260px
+   - フルwindow名は固定幅で自動折り返し
+   - ComboBox内は省略表示、hoverで全文確認
+
+2. 録画/配信操作
+   - 上部から実行ボタンを撤去
+   - 右側パネル中央～下部の「実行」領域へ集約
+   - 録画開始/停止を大きめボタン化
+   - 配信/録画+配信はPhase 9.4まで安全に無効
+
+3. 音声メーター
+   - 高さ8pxの細型
+   - 緑: 通常
+   - 黄: -18dB以上
+   - オレンジ: -12dB以上
+   - 赤: -6dB以上
+   - 音量スライダー表示幅も縮小
+
+既存のGPU録画、Fix12プレビュー経路、個別WAV、AviUtl2 Bottom導線は変更なし。
+
+Windows確認:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream

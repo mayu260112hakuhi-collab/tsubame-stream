@@ -1,0 +1,35 @@
+Yaoyorozu Stream Phase 8 Fix 10 — recording preview throttling
+
+Default while recording:
+- preview 15 FPS
+
+Optional:
+- preview OFF: no preview CPU readback
+- preview 30 FPS
+
+Normal idle preview:
+- 30 FPS
+
+Recording remains GPU-direct:
+WGC Direct3D11 Frame -> Windows Media Foundation H.264
+
+Validation:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream
+
+Compare the same game scene at:
+1. Preview 30 FPS
+2. Preview 15 FPS
+3. Preview OFF
+
+Record:
+- WGC callback FPS
+- GPU->CPU copy avg/max
+- GPU encoded frames
+- game smoothness
+- final MP4 smoothness
+
+Expected:
+OFF is the decisive diagnostic. If WGC approaches 60 FPS with Preview OFF,
+preview readback was the remaining bottleneck.

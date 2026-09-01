@@ -1,0 +1,19 @@
+Yaoyorozu Stream Phase 9.4.4 Fix1
+
+目的:
+- Yaoyorozu Stream 内の CPU 使用率を Windows タスク マネージャーと比較しやすい基準へ修正。
+
+変更:
+- sysinfo::Process::cpu_usage() の値を論理 CPU 数で除算。
+- PC 全体 = 100% の表示基準へ正規化。
+- 0.0〜100.0% にクランプ。
+- ステータス欄の FPS 表記を Capture FPS と明示。
+- バージョンを 0.16.3 へ更新。
+
+確認目安:
+- i5-12400F (12 logical CPUs) の場合、旧表示 90% 前後なら新表示は約 7.5% 前後。
+- タスク マネージャーと同時表示し、数秒待ってから近い値になることを確認。
+
+注記:
+- RAM は sysinfo の常駐メモリ量で、Windows タスク マネージャーの列と定義差があるため完全一致しない場合がある。
+- GPU / Disk / Network / Encode FPS / bitrate / drop / dup は後続の詳細負荷表示で追加予定。

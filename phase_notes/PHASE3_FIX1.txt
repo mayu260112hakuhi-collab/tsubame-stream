@@ -1,0 +1,14 @@
+Phase 3 Fix 1
+
+Root cause:
+- windows crate 0.58 GDI handle inner values are raw pointers, not integers.
+- BitBlt returns Result<(), windows::core::Error>, not BOOL.
+
+Changes:
+- handle.0 == 0 -> handle.0.is_null()
+- copied.as_bool() -> copied.is_err()
+
+Run on Windows:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream

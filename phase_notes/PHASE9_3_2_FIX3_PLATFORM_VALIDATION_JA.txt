@@ -1,0 +1,12 @@
+Phase 9.3.2 Fix3 配信先切替・URL判定修正
+
+不具合:
+- YouTube選択時にRTMP URLが弾かれ、Twitchへ切り替えると同じYouTube URLで配信ボタンが有効になる。
+- UIのComboBoxがStreamingTargetConfig.platformを先に直接変更していたため、set_platform()の変更処理が実行されず、YouTubeのURL/キーがTwitchへ残っていた。
+
+修正:
+- ComboBoxはローカル変数で選択し、変更確定後にset_platform()を呼ぶ。
+- サービス切替時はURL/ストリームキーをクリアし、bitrateをサービス既定値へ戻す。
+- YouTubeはRTMP/RTMPSの両方を受理する。
+- Twitch選択中にyoutube.com URL、YouTube選択中にtwitch.tv URLが入っている場合は配信開始を無効化。
+- RTMPのYouTube URLは使用可能。RTMPSは推奨メッセージのみ表示。

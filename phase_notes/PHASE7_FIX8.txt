@@ -1,0 +1,54 @@
+Yaoyorozu Stream Phase 7 Fix 8 — WGC frame-copy optimization
+
+Fix 7 evidence:
+- AMD AMF successfully active
+- Drop = 0
+- WGC callback still only ~20-30 FPS
+- therefore hardware encoder alone was not the bottleneck
+
+Important discovery in current capture code:
+A 1920x1080 RGBA frame is ~8.3 MB.
+The old callback did:
+1. GPU buffer -> bytes.to_vec()        (~8.3 MB copy)
+2. frame.clone() for recorder          (~8.3 MB copy)
+3. FrameQueue::push_latest clone       (~8.3 MB copy)
+4. preview path could clone again
+
+At 60 FPS this can create enormous memory bandwidth pressure inside the
+WGC callback itself.
+
+Fix 8:
+- CaptureFrame pixel storage changed Vec<u8> -> Arc<[u8]>
+- only ONE owned GPU->CPU byte copy remains per WGC callback
+- recorder/preview fanout clones only Arc refs, not pixel data
+- FrameQueue::push_latest no longer clones before try_send
+- preview remains capped near 30 FPS
+- UI now shows:
+  WGC callback FPS
+  GPU->CPU copy avg ms
+  GPU->CPU copy max ms
+  recorder unique input frame count
+  Output / Dup / Drop
+- test proves cloned frames share the exact same Arc pixel storage
+
+Run:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream
+
+Test with AMD AMF + Game 1080p60:
+1. Observe WGC callback before recording.
+2. Start recording and move camera continuously.
+3. Watch:
+   WGC callback FPS
+   GPU->CPU copy avg/max ms
+   Input unique
+   Output / Dup / Drop
+4. Compare game smoothness with Fix7.
+
+Interpretation:
+- copy avg > ~10-15 ms at 60fps: GPU->CPU mapping/copy is the major bottleneck.
+- callback rises substantially after Arc change: redundant memory copies were a major cause.
+- callback stays ~20-30 while copy is only a few ms: Windows/WGC delivery or source presentation cadence is limiting.
+- callback ~60 but Input unique much lower: queue/recorder path is limiting.
+- callback and Input ~60, Dup low: capture pipeline is healthy and next work can move to YouTube streaming.

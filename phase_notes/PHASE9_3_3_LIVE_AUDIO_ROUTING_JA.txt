@@ -1,0 +1,16 @@
+Phase 9.3.3 ライブ音声ルーティング
+
+目的
+- YouTube/Twitch のライブ送信へ、9.2系で作った音声ルーティングを接続する。
+
+実装
+- WASAPIでPC音声・マイク・アプリ音声を48kHz stereo PCM16としてライブ取得。
+- localhost UDPでFFmpegへ各チャンネルを独立転送。
+- 配信Mix ON / Mute / Gain を配信開始時にスナップショット。
+- FFmpeg側で各入力をvolume -> amix -> Master -> limiter -> AAC 44.1kHz stereoへ変換。
+- 配信Mix対象が0件なら従来通り無音AACへフォールバック。
+- アプリ音声もprocess loopbackでライブ送信対象に含む。
+
+注意
+- Phase 9.3.3ではGain/Mute/Masterの変更は配信開始時に固定。配信中のリアルタイム変更反映は次段階。
+- YouTubeブラウザ側の「配信終了」をアプリへ同期するにはYouTube API/OAuthが必要なので別段階。

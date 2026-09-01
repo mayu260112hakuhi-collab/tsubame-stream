@@ -1,0 +1,13 @@
+[workspace]
+members = [
+  "crates/stream-core",
+  "crates/stream-capture",
+  "crates/stream-audio",
+  "crates/stream-recording",
+  "apps/yaoyorozu-stream"
+]
+resolver = "2"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

@@ -1,0 +1,17 @@
+Phase 9.2.4 Fix2 - 個別WAV保存OFF時の一時ファイル削除修正
+
+症状:
+- 「個別WAV保存」をOFFにして録画しても、録画後に *.audio.txt が残る場合があった。
+- WAV本体だけを削除しており、PCM診断用サイドカーが削除対象に含まれていなかった。
+
+修正:
+- 一時トラック削除を remove_temporary_track_files() に集約。
+- 保存OFFのトラックでは以下を両方削除する。
+  - *.wav
+  - *.audio.txt
+- PC音声 / マイク / アプリ個別音声のすべてに同じ処理を適用。
+
+期待挙動:
+- Mix ON + 個別保存 OFF: Mixに利用後、WAVとaudio.txtを削除。
+- Mix OFF + 個別保存 OFF: 録画終了後、WAVとaudio.txtを削除。
+- 個別保存 ON: WAVとaudio.txtを保持。

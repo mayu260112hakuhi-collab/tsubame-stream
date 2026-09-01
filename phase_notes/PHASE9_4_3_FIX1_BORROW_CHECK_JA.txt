@@ -1,0 +1,12 @@
+Phase 9.4.3 Fix1 - 画像オーバーレイ ビルド修正
+
+修正内容:
+- scene.rs: ImageOverlaySource::clamp_to_frame() で self.aspect() を先にローカル変数へ退避し、可変借用と不変借用の競合 E0502 を解消。
+- app.rs: egui::Stroke::new の 1.5 を 1.5_f32 に明示し、future_incompatible 警告を解消。
+- streaming.rs: 未使用の input を _input に変更。
+
+確認コマンド:
+  cargo fmt --all
+  cargo test --workspace
+
+Phase 9.4.3 の機能仕様に変更なし。

@@ -1,0 +1,14 @@
+[package]
+name = "yaoyorozu-stream"
+version = "0.18.2"
+edition = "2021"
+
+[dependencies]
+stream-core = { path = "../../crates/stream-core" }
+stream-capture = { path = "../../crates/stream-capture" }
+stream-audio = { path = "../../crates/stream-audio" }
+stream-recording = { path = "../../crates/stream-recording" }
+eframe = "0.32"
+image = "0.25"
+rfd = "0.15"
+sysinfo = "0.38"

@@ -1,0 +1,15 @@
+Phase 9.2.3 Fix1
+=================
+
+修正内容:
+- wasapi 0.24.0 の WaveFormat::new() が sample_rate に usize を要求するため、
+  アプリ別音声キャプチャ側の SAMPLE_RATE を `SAMPLE_RATE as usize` で渡すよう修正。
+- 既存のPCM録音側と同じ型変換に統一。
+- ルートに散らばっていた PHASE*.txt を `phase_notes/` ディレクトリへ集約。
+
+ユーザー側確認:
+    cargo test --workspace
+    cargo check --workspace
+    cargo run -p yaoyorozu-stream
+
+この環境ではCargo/Rustコンパイルは実行していません。

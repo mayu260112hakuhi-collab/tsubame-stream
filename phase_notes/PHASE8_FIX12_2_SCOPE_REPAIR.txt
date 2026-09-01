@@ -1,0 +1,3 @@
+Fix 12.2
+Root cause: d3d_none_error is at crate root while its 3 calls are inside nested wgc module.
+Repair: use crate::d3d_none_error(...). No runtime behavior changed.

@@ -1,0 +1,13 @@
+# Rust build
+/target/
+
+# Recording / generated files
+/recordings/
+*.wav
+*.mp4
+*.tmp
+
+# Local secrets
+.env
+.env.*
+!.env.example

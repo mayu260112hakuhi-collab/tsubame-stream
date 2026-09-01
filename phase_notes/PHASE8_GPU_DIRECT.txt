@@ -1,0 +1,63 @@
+Yaoyorozu Stream Phase 8 — DirectX GPU recording path
+
+Evidence from Fix8:
+- WGC callback ~30 FPS while target is 60
+- GPU->CPU readback avg ~21.82 ms, max ~22.76 ms
+- 60 FPS budget is 16.67 ms
+- therefore CPU readback cannot sustain real 60 FPS
+
+New architecture:
+
+WGC Direct3D11 Frame
+  ├─> windows-capture VideoEncoder::send_frame(frame)
+  │      DirectX surface path / hardware-accelerated H.264
+  │      NO frame.buffer()
+  │      NO CPU RGBA roundtrip
+  │
+  └─> every ~33ms only:
+         frame.buffer()
+         GPU->CPU RGBA
+         egui preview
+
+Audio:
+- microphone.wav: existing WASAPI PCM
+- desktop.wav: existing WASAPI loopback PCM
+
+Finalize:
+- DirectX encoder produces video_only.mp4
+- FFmpeg is used only for final audio mix/mux:
+  video_only.mp4 + microphone.wav + desktop.wav -> recording.mp4
+
+Important:
+windows-capture 2.0.1 exposes Frame::as_raw_texture/as_raw_surface and its
+VideoEncoder::send_frame(frame) uses DirectX surfaces. This phase uses that
+native path rather than converting every recording frame to CPU RGBA.
+
+Validation:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream
+
+Game test:
+1. Game preset 1080p60.
+2. Select Genshin or ZZZ.
+3. Start recording.
+4. UI should say:
+   DirectX GPU / Windows Media Foundation H.264
+5. During recording watch:
+   WGC callback FPS
+   GPU->CPU copy avg/max
+   GPU encoded frames
+6. Move camera continuously 10-20 seconds.
+7. Stop, wait for recording.mp4.
+8. Verify:
+   game is smoother during recording
+   recorded video is smoother
+   audio tracks remain correct
+
+Expected major change:
+GPU->CPU copy is now executed only for ~30 FPS UI preview, not for every
+recording frame. The actual recording frames go straight from Direct3D11
+capture surface into the Windows hardware video encoder.
+
+If build errors occur, copy the complete Rust compiler output.

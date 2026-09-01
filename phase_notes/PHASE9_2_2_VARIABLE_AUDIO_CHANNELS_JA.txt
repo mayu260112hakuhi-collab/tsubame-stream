@@ -1,0 +1,10 @@
+Yaoyorozu Stream Phase 9.2.2 可変音声チャンネル
+
+- MixerControl互換を維持しながらChannelMixerControlを追加
+- PC音声 / マイクを組み込みAudioChannelとして管理
+- 「＋ 音声ソース追加」で可変チャンネルを追加
+- 追加チャンネルごとにGain / Mute / 配信Mix / 個別WAVフラグ
+- 追加チャンネルは削除可能、PC音声 / マイクは削除不可
+- Phase 9.2.3でApplicationチャンネルをWindowsアプリ音声セッションへ接続予定
+- Discordを最初のアプリ音声対応対象とする
+- 既存録画のMixerSettingsとraw WAV契約は維持

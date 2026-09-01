@@ -1,0 +1,11 @@
+Phase 9.2.4 Fix1
+
+修正内容:
+- stream-audio: application_threads の型推論エラー E0282 を修正
+  Vec<(AudioChannelId, JoinHandle<Result<(), AudioError>>)> を明示
+- stream-capture: SetMultithreadProtected(true) の未使用 BOOL 警告を let _ = ... で処理
+
+ユーザー環境で確認:
+  cargo test --workspace
+  cargo check --workspace
+  cargo run -p yaoyorozu-stream

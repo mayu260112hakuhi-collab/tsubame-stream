@@ -1,0 +1,16 @@
+[package]
+name = "stream-capture"
+version = "0.5.2"
+edition = "2021"
+
+[dependencies]
+crossbeam-channel = "0.5"
+stream-core = { path = "../stream-core" }
+
+[target.'cfg(windows)'.dependencies]
+windows-capture = "2.0.1"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common"
+] }

@@ -1,0 +1,48 @@
+Yaoyorozu Stream Phase 7 Fix 7 — AMD AMF hardware encoding verification
+
+Fix 6 evidence:
+- recording path separation worked
+- Drop stayed 0
+- WGC fell to ~18.6 FPS during recording
+- encoder displayed CPU libx264
+- game also stuttered during recording
+
+This build targets the encoder bottleneck.
+
+Changes:
+1. Hardware encoder probing now performs a real 1920x1080@60 test,
+   12 frames, 6 Mbps, instead of the old tiny one-frame probe.
+2. Probe captures FFmpeg stderr for every backend.
+3. Explicit encoder preference UI:
+   Auto / AMD AMF / NVIDIA NVENC / Intel QSV / CPU libx264.
+4. Development default is AMD AMF so RX 6600 is tested directly.
+5. If AMF cannot initialize, recording DOES NOT silently fall back to CPU.
+   The exact FFmpeg AMF error is shown instead.
+6. AMF recording args:
+   usage=transcoding
+   quality=speed
+   rc=cbr
+7. UI records the actual encoder display name.
+
+Validation:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream
+
+Test:
+1. Leave Encoder = AMD AMF.
+2. Select Game 1080p60.
+3. Start recording.
+4. If recording starts, right panel must say:
+   録画中: AMD AMF
+5. Observe game smoothness and WGC実取得 FPS.
+6. Record 10-20 sec and verify MP4.
+7. If recording refuses to start, copy the full:
+   録画開始失敗: FFmpegエラー: AMD AMF ...
+   message. This is now the real driver/FFmpeg reason.
+
+Success target:
+- actual encoder = AMD AMF
+- WGC FPS substantially higher than Fix6's ~18.6 FPS
+- game stutter reduced
+- Drop remains near zero

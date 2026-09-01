@@ -1,0 +1,14 @@
+Yaoyorozu Stream Phase 3 validation
+
+1. cargo test --workspace
+2. cargo check --workspace
+3. cargo run -p yaoyorozu-stream
+
+Expected:
+- Japanese labels are readable using a Windows system Japanese font.
+- Primary desktop appears in the central Preview.
+- UI remains interactive while capture is running.
+- If capture cannot keep up, stale preview frames are dropped rather than queued indefinitely.
+
+Phase 3 uses GDI BitBlt as the first Windows capture backend for reliability and simplicity.
+A later phase can replace/augment it with Windows Graphics Capture for per-window capture and GPU-friendly zero-copy paths.

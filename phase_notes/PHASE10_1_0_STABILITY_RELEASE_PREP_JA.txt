@@ -1,0 +1,17 @@
+Phase 10.1.0: 安定化・配布準備 1
+
+目的:
+- UI確定後、配布に向けてコンパイラ警告と不要コードを整理する。
+- release ビルドを配布前提の設定へ寄せる。
+
+変更:
+- stream-audio: next_port クロージャの不要な mut を削除。
+- stream-audio: 未使用だった default 録音ラッパー2関数を削除。
+  実際の record_capture / record_loopback は維持。
+- stream-capture: WgcHandler 内で保持していた未使用 preview_queue フィールドを削除。
+  PreviewReadbackWorker へのキュー受け渡しは HandlerFlags 経由のまま維持。
+- stream-recording: 現在の routed mux に置き換え済みの旧 mux_final_mp4 を削除。
+- root Cargo.toml: release に thin LTO / symbol strip を追加。
+- アプリバージョン: 0.18.0
+
+機能変更は行わず、既存の録画・配信・音声ミキサー挙動を維持する方針。

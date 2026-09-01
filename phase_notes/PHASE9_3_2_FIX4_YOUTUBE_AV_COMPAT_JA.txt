@@ -1,0 +1,17 @@
+Phase 9.3.2 Fix4 YouTube A/V互換性修正
+
+症状:
+- YouTube側で配信セッション自体は開始するが、映像/音声が確認できない。
+
+修正:
+- Windows Media Foundation h264_mf から libx264 へ切替。
+- veryfast + zerolatency。
+- yuv420p / CFR。
+- GOPを2秒固定、keyint_min同値、scene cut無効。
+- bitrate/minrate/maxrate/bufsizeを明示。
+- FLV no_duration_filesize を指定。
+- FFmpegログレベルを info に上げ、実際の frame/fps/bitrate や警告を診断可能にした。
+
+重要:
+- ライブ音声はまだ実WASAPI Mix未接続。現在はYouTube ingest互換性確認用の無音AAC stereo 44.1kHz/128kbps。
+- したがって、このFixで映像が届いても「声/PC音が聞こえない」のは現段階では仕様。

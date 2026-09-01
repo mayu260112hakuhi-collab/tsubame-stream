@@ -1,0 +1,24 @@
+Yaoyorozu Stream Phase 5 — Windows Graphics Capture
+
+Backend:
+- windows-capture 2.0.1
+- Windows Graphics Capture API
+- ColorFormat::Rgba8
+- start_free_threaded()
+- bounded latest-frame queue remains in place
+
+Run:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream
+
+Manual checks:
+1. Select the same Explorer window that showed a black region with GDI.
+2. Confirm GPU/composited regions render more completely with WGC.
+3. Test Blender.
+4. Test browser video / GPU-accelerated content.
+5. Switch repeatedly between Desktop and Window sources.
+6. Verify UI stays responsive.
+7. Close a captured window and confirm the app itself remains alive.
+
+If compilation fails, send the complete Rust error output unchanged.

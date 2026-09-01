@@ -1,0 +1,6 @@
+Phase 9.5.1 Fix1: eframe 0.32 Viewport Context 修正
+
+- eframe/egui 0.32 の show_viewport_immediate callback が egui::Context を渡す構成に合わせて修正。
+- callback 内で Context に対して ui.vertical() を呼んでいたため E0599 が発生していた。
+- egui::CentralPanel::default().show(preview_ctx, |ui| ...) を介して Ui を生成し、別プレビューウィンドウを描画する。
+- プレビュー開閉、画像/ししゃものドラッグ・拡縮仕様は変更なし。

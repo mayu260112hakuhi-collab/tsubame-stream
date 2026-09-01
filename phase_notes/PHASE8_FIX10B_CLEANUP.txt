@@ -1,0 +1,38 @@
+Yaoyorozu Stream Phase 8 Fix 10B
+
+Purpose:
+- Fix the 15 FPS preview policy test failure caused by a 1 ns floating-point rounding difference.
+- Remove legacy CPU recording-path code/warnings left behind after Phase 8 GPU-direct recording.
+
+Changes:
+1. preview_policy test now compares Duration using the same from_secs_f64(1/15) construction.
+2. removed unused recording_queue from WGC handler/worker.
+3. removed legacy CPU raw-video writer imports/helpers:
+   - io::Write
+   - AtomicBool / AtomicU64 / Ordering / Arc
+   - encoder_specific_recording_args()
+   - VideoWriter
+4. no behavior change to:
+   - DirectX GPU recording
+   - 15 FPS preview
+   - Preview OFF
+   - 30 FPS preview
+   - WASAPI audio recording
+   - FFmpeg final mux
+
+Run:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream
+
+Expected:
+- preview_policy tests all pass
+- previous dead_code/unused_import warnings should be gone or substantially reduced
+- app behavior remains identical
+
+Next runtime test:
+Compare recording preview modes 30 FPS / 15 FPS / OFF and note:
+- WGC callback FPS
+- GPU->CPU copy avg/max
+- GPU encoded frames
+- game smoothness

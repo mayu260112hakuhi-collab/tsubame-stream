@@ -1,0 +1,39 @@
+Yaoyorozu Stream Phase 9.2.3 - アプリ別音声キャプチャ
+
+追加内容
+- Windowsの音声セッションを列挙して実行中アプリ音声候補を表示
+- Discordを候補の先頭に表示
+- Chromium/Discordなどのマルチプロセス構成では同名親プロセスまで遡ってcapture PIDを決定
+- wasapi 0.24 の AudioClient::new_application_loopback_client を利用
+- Windows process-loopbackで選択アプリの音声だけを独立キャプチャ
+- アプリ音声チャンネルにリアルタイムメーター / Gain / Mute / 配信Mix参加を接続
+- アプリ音声チャンネル削除時に専用キャプチャスレッドを停止
+- 同じアプリの重複追加を防止
+- Discord以外もChrome・ゲーム等、Windows音声セッションとして見えるアプリに対応
+
+UI
+1. 「アプリ音声一覧更新」を押す
+2. 「アプリ音声を選択」からDiscord等を選択
+3. 「＋追加」で独立チャンネル化
+
+Phase 9.2.3の境界
+- リアルタイムのアプリ別キャプチャとメーターまで
+- アプリ音声の個別WAV保存と完成MP4への合流はPhase 9.2.4
+- 既存 microphone.wav / desktop.wav の仕様は変更しない
+
+Windows要件
+- process loopback APIはWindows 10 build 20348以降
+- Yaoyorozu Streamの主対象であるWindows 11では利用可能
+
+確認コマンド
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream
+
+実機確認
+- Discordを起動して通話または音声再生状態にする
+- アプリ音声一覧更新
+- ★ Discord が候補に出ること
+- Discordを追加して、Discord側で音が鳴ると専用メーターが動くこと
+- Discord Gain/Muteが専用メーターへ反映されること
+- PC音声/マイクの既存メーターが継続すること

@@ -1,0 +1,17 @@
+Phase 9.3.2 Fix2 - YouTube取り込み互換性修正
+
+変更点:
+- YouTubeはRTMPS URL必須に変更。通常RTMP URLでは配信開始ボタンを有効化しない。
+- H.264送信に 2秒GOP、min/max bitrate制約、yuv420p を設定。
+- 配信ストリームへ AAC stereo 128kbps / 44.1kHz の無音トラックを常時追加。
+  これはYouTube取り込み互換性の確認用。実際のWASAPI配信Mixは次段階で置換する。
+- アプリ側の状態表示を「LIVE」から「送信中」へ変更。
+  FFmpegプロセス稼働だけでは配信サービス側の受信成立を断定しない。
+- YouTube RTMP URL入力時は、ライブ管理画面の鍵アイコンからRTMPS URLを取得するよう案内。
+- FFmpeg stderr診断はFix1から継続。
+
+確認ポイント:
+1. YouTube Live Control Room のストリームURL欄で鍵アイコンを押し、RTMPS URLを取得する。
+2. RTMPS URL + 新しいストリームキーを入力する。
+3. 八百万Streamで「送信中」になる。
+4. YouTube Studio側が「データを受信しています」へ変わるか確認する。

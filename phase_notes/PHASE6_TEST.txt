@@ -1,0 +1,29 @@
+Yaoyorozu Stream Phase 6 — Windows audio meters
+
+Added:
+- stream-audio crate
+- WASAPI 0.24 endpoint meters
+- default microphone peak
+- default PC/output peak
+- preview Mix meter
+- mic / PC enable toggles
+- default device names
+- all audio COM objects stay on a dedicated worker thread
+
+Important:
+This phase makes the three UI audio paths real at the LEVEL/METER layer.
+PCM sample capture and actual sample mixing are deliberately kept for the
+recording/encoder phase so the UI never owns audio buffers.
+
+Run:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream
+
+Manual:
+1. Speak into the microphone -> Mic meter should move.
+2. Play YouTube/game audio -> PC meter should move.
+3. Mix meter follows whichever enabled source is louder.
+4. Disable Mic -> Mix ignores Mic.
+5. Disable PC -> Mix ignores PC.
+6. UI and WGC preview must remain responsive while meters move.

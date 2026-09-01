@@ -1,0 +1,19 @@
+Phase 9.5.4: Preview CPU負荷削減
+
+目的:
+OBS比較で待機時CPUが約7〜8%だったため、プレビュー経路の不要処理を止める。
+
+変更:
+- プレビュー別窓OFF + 非配信 + 非録画時はWGCのCPU readbackをOFF。
+- ソース切替直後は解像度取得のため最初のpreview frameだけ許可し、その後OFFへ。
+- プレビューOFFでも配信中は30 FPS readbackを維持し、ライブ映像経路を壊さない。
+- プレビューOFF時はegui ColorImage生成とTexture uploadを完全に省略。
+- オーバーレイ未使用時はCaptureFrameのRGBA Arcをそのまま利用し、毎フレームのRGBA全コピーを省略。
+- オーバーレイ有効時だけCPU合成用RGBAコピーを作成。
+- UI repaintを通常60 FPS相当から30 FPSへ。プレビューOFF待機時は10 FPS相当まで低下。
+- 録画中は既存の30/15/OFF preview設定を尊重。
+
+期待効果:
+- プレビューOFF待機時のCPUを大幅削減。
+- プレビューON時も不要な60 FPS UI repaintを半減。
+- 配信経路・GPU direct録画経路の仕様は維持。

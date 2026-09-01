@@ -1,0 +1,47 @@
+Yaoyorozu Stream Phase 7 Fix 6 — UI/recording path separation
+
+Fix 5 evidence:
+- Game preset target: 60 FPS
+- WGC measured around 30 FPS
+- Output 60 FPS
+- duplicate frame count was very high
+- game itself stuttered when recording began
+
+Architecture change:
+BEFORE:
+WGC -> preview queue -> egui update -> RecordingSession -> FFmpeg
+
+AFTER:
+                 -> preview queue (max ~30 FPS) -> egui
+WGC callback ----|
+                 -> recording queue (every callback) -> RecordingSession -> FFmpeg
+
+Important:
+- Recording no longer depends on egui update/repaint cadence.
+- Preview texture uploads are capped near 30 FPS.
+- During recording, egui repaint request is 30 FPS.
+- Recorder consumes its dedicated WGC queue directly.
+- Recorder still uses wall-clock pacing for correct MP4 duration.
+- WGC stats / Output / Dup / Drop remain visible.
+
+Validation:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream
+
+Test with Genshin / ZZZ:
+1. Game preset 1080p60.
+2. Note WGC実取得 before recording.
+3. Start recording and move camera continuously.
+4. Observe game smoothness.
+5. Note WGC実取得, Output, Dup, Drop.
+6. Stop after 10-20 sec.
+7. Playback recording.mp4.
+
+Expected:
+- UI preview may be ~30 FPS by design.
+- recorder is independent of preview FPS.
+- game should feel lighter than Fix 5.
+- if WGC callback itself stays near 30 FPS, Dup will remain high.
+  That would mean the next optimization target is WGC/GPU capture delivery,
+  not egui.

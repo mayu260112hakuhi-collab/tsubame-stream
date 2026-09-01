@@ -1,0 +1,56 @@
+Yaoyorozu Stream Phase 8 Fix 12 — GPU preview downscale before readback
+
+Goal:
+Keep 1920x1080@60 GPU recording unchanged while reducing preview readback
+bandwidth by scaling on the GPU first.
+
+New preview path:
+WGC 1920x1080 Direct3D11 texture
+  -> D3D11 VideoProcessor GPU scale
+  -> max 960x540 GPU texture
+  -> CopyResource to staging
+  -> async Preview Worker Map
+  -> compact RGBA
+  -> egui
+
+Recording path remains:
+WGC Direct3D11 texture
+  -> Windows Media Foundation H.264
+No CPU readback.
+
+Expected bandwidth:
+1920x1080 RGBA ~= 8.29 MB/frame
+960x540 RGBA   ~= 2.07 MB/frame
+Preview CPU transfer is roughly one quarter of full-HD.
+
+Scaling policy:
+- max 960x540
+- preserve aspect ratio
+- never upscale smaller captures
+- Preview OFF still does zero scaling/readback
+
+Diagnostics remain:
+- WGC callback FPS
+- 540p async readback avg/max
+- Preview worker frames/jobs dropped
+- GPU encoded frames
+
+Run on Windows:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream
+
+Test with same Genshin scene:
+1. Preview 15 FPS
+2. Preview 30 FPS
+3. Compare against previous Fix11 measurements (~46.8 / ~48.3 callback FPS)
+4. Check game smoothness and final recording.mp4.
+
+Success target:
+- preview enabled callback moves closer to Preview OFF (~54 FPS)
+- readback latency drops
+- jobs dropped remains near zero
+- recorded 1080p video and audio are unchanged
+
+This phase uses ID3D11VideoProcessor for hardware scaling. If Windows produces
+a Direct3D11 compile/signature error, send the full compiler output unchanged.

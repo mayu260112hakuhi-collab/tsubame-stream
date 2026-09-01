@@ -1,0 +1,28 @@
+Yaoyorozu Stream Phase 9.2.1 — 音声デバイス選択
+
+追加:
+- PC音声の出力デバイスをComboBoxから選択
+- マイク入力デバイスをComboBoxから選択
+- Windows既定を常設
+- 音声デバイス一覧更新ボタン
+- デバイスIDで選択を保持
+- 選択変更時はマイク/PC音声を別スレッドで個別再接続
+- 接続 / 再接続中 / 切断ステータス
+- 選択したデバイスを録画用PCM WAVにも反映
+
+維持:
+- Gain / Mute / Master
+- microphone.wav / desktop.wav は原音保存
+- 完成MP4へのMixer設定反映
+- GPU Direct録画
+- 約300pxの軽量プレビュー
+- AviUtl2連携とマーカー
+
+確認コマンド（Windows）:
+  cargo test --workspace
+  cargo check --workspace
+  cargo run -p yaoyorozu-stream
+
+注意:
+生成環境にはRust/Cargoが無いため、このzip自体ではcargo test/cargo checkを実行できていません。
+Windows実機で上記コマンドを実行してください。

@@ -1,0 +1,12 @@
+Fix 10A build repair
+
+Root cause:
+PreviewMode and PreviewPolicy are declared in the stream_capture crate root,
+while WgcHandler lives in the nested cfg(windows) wgc module. Rust module
+scope does not automatically import parent names unqualified.
+
+Repair:
+- import crate::{PreviewMode, PreviewPolicy} inside mod wgc
+- remove unused crossbeam_channel::unbounded import
+
+No recording/preview behavior was changed.

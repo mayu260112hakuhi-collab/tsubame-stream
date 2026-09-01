@@ -1,0 +1,12 @@
+[package]
+name = "stream-recording"
+version = "0.4.0"
+edition = "2021"
+
+[dependencies]
+chrono = "0.4"
+crossbeam-channel = "0.5"
+serde_json = "1"
+stream-core = { path = "../stream-core" }
+stream-capture = { path = "../stream-capture" }
+stream-audio = { path = "../stream-audio" }

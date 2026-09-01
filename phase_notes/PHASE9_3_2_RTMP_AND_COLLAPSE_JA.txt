@@ -1,0 +1,18 @@
+Phase 9.3.2 RTMP/RTMPS transport + UI detail folding
+
+UI
+- 映像ソース欄の WGC統計 / FFmpegパス / Encoder / 録画中プレビューを「詳細情報」へ折りたたみ。
+- 普段必要なプレビュー・映像ソース・音声ミキサー・シーンの縦領域を確保。
+
+Streaming
+- YouTube / Twitch のRTMP・RTMPS URL + stream keyからpublish URLを生成。
+- 「配信開始」「配信停止」「録画＋配信」を有効化。
+- 選択中のデスクトップまたはウィンドウをFFmpeg gdigrabで取得。
+- h264_mf -> FLV -> RTMP/RTMPSで送信。
+- プリセットの解像度/FPSとサービス別bitrate設定を利用。
+- FFmpegプロセス終了をUI側で検知しOFFLINEへ戻す。
+
+重要
+- 9.3.2はネットワーク映像経路の接続フェーズ。
+- 既存のWASAPIアプリ別Mixをライブ配信へ直接流す処理は次段階で接続する。
+- 録画側の音声Mix/個別WAVは9.2.4のまま変更なし。

@@ -1,0 +1,66 @@
+Yaoyorozu Stream Phase 8 Fix 11 — asynchronous preview readback
+
+Evidence:
+- Preview OFF: WGC callback ~54 FPS, GPU->CPU copy = 0 ms
+- Preview 15/30: WGC callback ~39-40 FPS, synchronous readback ~20 ms
+- Therefore synchronous frame.buffer() was blocking the WGC callback.
+
+Architecture change:
+
+BEFORE
+WGC callback
+  -> GPU H.264 send_frame()
+  -> frame.buffer()          BLOCKING ~20 ms
+  -> CPU RGBA
+  -> preview
+
+AFTER
+WGC callback
+  -> GPU H.264 send_frame()
+  -> CopyResource() into staging texture (GPU queued, returns quickly)
+  -> preview worker job
+  -> callback returns
+
+Preview worker
+  -> Map staging texture
+  -> compact RowPitch padding
+  -> Arc<[u8]> RGBA
+  -> egui preview queue
+  -> recycle staging texture
+
+Implementation details:
+- 3 reusable D3D11 staging textures
+- bounded preview worker queue (capacity 2)
+- latest/skip behavior instead of blocking capture
+- ID3D11Multithread protection enabled before sharing immediate context
+- recording remains DirectX GPU direct
+- Preview OFF still performs zero readback
+- 15/30 FPS preview policy remains
+
+New diagnostics:
+- WGC callback FPS
+- Async preview readback avg/max ms
+- Preview worker completed frames
+- Preview jobs dropped
+- GPU encoded frames
+
+Run:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream
+
+Test:
+Use the same game scene and compare Preview 15 and 30.
+The important target is NOT readback time itself; it is whether WGC callback
+stays much closer to the Preview OFF result while the worker absorbs the
+20 ms CPU readback asynchronously.
+
+Expected:
+- game smoothness improves with preview enabled
+- WGC callback significantly higher than Fix10's ~39-40 FPS
+- GPU recording remains unaffected
+- jobs dropped may rise under load; that is acceptable for preview because
+  preview is latest-frame UI only
+
+If Windows compilation reports a Direct3D11 API type/signature error,
+send the complete compiler output unchanged.

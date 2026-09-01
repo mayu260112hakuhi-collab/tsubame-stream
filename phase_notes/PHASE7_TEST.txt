@@ -1,0 +1,47 @@
+Yaoyorozu Stream Phase 7 — local recording pipeline
+
+New:
+- stream-recording crate
+- FFmpeg auto-detection
+- encoder preference: NVENC -> AMF -> Quick Sync -> libx264
+- bounded video frame channel; UI never waits for FFmpeg
+- WGC frames -> raw RGBA -> H.264 video_only.mp4
+- WASAPI 48kHz float stereo mic -> microphone.wav
+- WASAPI loopback 48kHz float stereo -> desktop.wav
+- stop/finalize on background thread
+- final mux: video copy + AAC mixed audio -> recording.mp4
+- yaoyorozu_edit.json saved beside media
+- source switching disabled while recording
+
+Required runtime dependency:
+FFmpeg executable must be on PATH.
+
+Install on Windows if needed:
+winget install --id Gyan.FFmpeg -e
+
+Then OPEN A NEW POWERSHELL before testing.
+
+Build:
+cargo test --workspace
+cargo check --workspace
+cargo run -p yaoyorozu-stream
+
+Manual:
+1. Make sure preview is visible.
+2. Click 録画開始.
+3. Move in a game/window, play PC audio, speak into mic.
+4. Wait 10-20 sec.
+5. Click 録画停止.
+6. Wait until status becomes 録画完了.
+7. Check recordings/<timestamp>/:
+   recording.mp4
+   video_only.mp4
+   microphone.wav
+   desktop.wav
+   yaoyorozu_edit.json
+8. Open recording.mp4 and verify video + mixed audio.
+9. Open mic/desktop WAV separately and verify editor separation.
+
+Important:
+This is the first integrated recording pass. A/V start alignment is session-level
+but sub-frame synchronization/drift correction will be refined before YouTube live.
