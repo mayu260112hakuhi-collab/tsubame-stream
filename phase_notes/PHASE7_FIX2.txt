@@ -21,7 +21,7 @@ Expected:
 Run:
 cargo test --workspace
 cargo check --workspace
-cargo run -p yaoyorozu-stream
+cargo run -p tsubame
 
 Manual timing test:
 1. Start a stopwatch.

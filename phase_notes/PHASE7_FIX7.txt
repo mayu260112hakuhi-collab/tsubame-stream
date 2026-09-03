@@ -27,7 +27,7 @@ Changes:
 Validation:
 cargo test --workspace
 cargo check --workspace
-cargo run -p yaoyorozu-stream
+cargo run -p tsubame
 
 Test:
 1. Leave Encoder = AMD AMF.

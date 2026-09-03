@@ -2,7 +2,7 @@
 
 **目的:** PC音声とマイクについて、Windows音声デバイスの列挙・選択・再接続を追加する。
 
-**構成:** `stream-audio` にデバイス型・列挙・選択状態・再接続制御を追加し、`yaoyorozu-stream` のegui側ではComboBoxで選択する。既存のGain/Mute/Master、原音WAV、GPU録画、Fix12プレビュー、AviUtl2連携は維持する。
+**構成:** `stream-audio` にデバイス型・列挙・選択状態・再接続制御を追加し、`tsubame` のegui側ではComboBoxで選択する。既存のGain/Mute/Master、原音WAV、GPU録画、Fix12プレビュー、AviUtl2連携は維持する。
 
 **参照設計書:** `2026-08-27-phase9-2-audio-sources-discord-design-ja.md`
 
@@ -162,8 +162,8 @@ pub enum AudioReconnectTarget {
 
 ## Task 7: egui ComboBox
 **Files**
-- Modify: `apps/yaoyorozu-stream/src/app.rs`
-- Test: `apps/yaoyorozu-stream/tests/phase9_ui.rs`
+- Modify: `apps/tsubame/src/app.rs`
+- Test: `apps/tsubame/tests/phase9_ui.rs`
 
 UI:
 ```text
@@ -183,7 +183,7 @@ PC音声デバイス
 ## Task 8: 切断状態
 **Files**
 - Modify: `crates/stream-audio/src/lib.rs`
-- Modify: `apps/yaoyorozu-stream/src/app.rs`
+- Modify: `apps/tsubame/src/app.rs`
 
 追加型:
 ```rust
@@ -209,7 +209,7 @@ UI表示:
 cargo test -p stream-audio
 cargo test --workspace
 cargo check --workspace
-cargo run -p yaoyorozu-stream
+cargo run -p tsubame
 ```
 
 手動確認:

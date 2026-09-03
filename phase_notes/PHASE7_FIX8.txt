@@ -34,7 +34,7 @@ Fix 8:
 Run:
 cargo test --workspace
 cargo check --workspace
-cargo run -p yaoyorozu-stream
+cargo run -p tsubame
 
 Test with AMD AMF + Game 1080p60:
 1. Observe WGC callback before recording.

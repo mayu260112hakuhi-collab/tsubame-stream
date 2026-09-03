@@ -4,6 +4,6 @@ members = [
   "crates/stream-capture",
   "crates/stream-audio",
   "crates/stream-recording",
-  "apps/yaoyorozu-stream"
+  "apps/tsubame"
 ]
 resolver = "2"

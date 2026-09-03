@@ -1,0 +1,145 @@
+--- a/apps/tsubame/src/app.rs
++++ b/apps/tsubame/src/app.rs
+@@ -363,7 +363,7 @@
+         .map(|ext| {
+             matches!(
+                 ext.to_ascii_lowercase().as_str(),
+-                "png" | "jpg" | "jpeg" | "webp" | "bmp"
++                "png" | "jpg" | "jpeg" | "webp" | "bmp" | "svg"
+             )
+         })
+         .unwrap_or(false)
+@@ -503,7 +503,7 @@
+     fn refresh_image_library(&mut self) {
+         self.image_library_files = scan_image_library(&self.image_library_dir);
+         self.image_library_message = format!(
+-            "画像ライブラリ: {} 枚 / {}",
++            "画像ライブラリ: {} 素材 / {}",
+             self.image_library_files.len(),
+             self.image_library_dir.display()
+         );
+@@ -2027,7 +2027,7 @@
+                     ui.horizontal_wrapped(|ui| {
+                         if ui.button("＋ 画像").clicked() {
+                             if let Some(path) = rfd::FileDialog::new()
+-                                .add_filter("画像", &["png", "jpg", "jpeg", "webp", "bmp"])
++                                .add_filter("画像 / SVG", &["png", "jpg", "jpeg", "webp", "bmp", "svg"])
+                                 .pick_file()
+                             {
+                                 self.add_image_from_path(&path);
+@@ -2052,7 +2052,7 @@
+                                 }
+                             });
+                             ui.small(&self.image_library_message);
+-                            ui.small("image/ に入れた画像を自動認識します。background / overlay / wipe / thumbnail の各フォルダも使用できます。");
++                            ui.small("image/ に入れた画像・SVGを自動認識します。background / overlay / wipe / thumbnail の各フォルダも使用できます。");
+ 
+                             let mut add_from_library: Option<PathBuf> = None;
+                             egui::ScrollArea::vertical()
+@@ -2060,7 +2060,7 @@
+                                 .max_height(150.0)
+                                 .show(ui, |ui| {
+                                     if self.image_library_files.is_empty() {
+-                                        ui.small("まだ画像がありません。image/ に画像を入れて「更新」を押してください。");
++                                        ui.small("まだ素材がありません。image/ に画像またはSVGを入れて「更新」を押してください。");
+                                     } else {
+                                         for path in &self.image_library_files {
+                                             let relative = path
+--- a/apps/tsubame/src/scene.rs
++++ b/apps/tsubame/src/scene.rs
+@@ -223,13 +223,24 @@
+     const MAX_WIDTH_PERCENT: f32 = 80.0;
+ 
+     pub fn load(path: &Path) -> Result<Self, String> {
+-        let decoded = image::open(path)
+-            .map_err(|err| format!("画像を開けませんでした: {err}"))?
+-            .to_rgba8();
+-        let (pixel_width, pixel_height) = decoded.dimensions();
+-        if pixel_width == 0 || pixel_height == 0 {
+-            return Err("画像サイズが0です".to_owned());
+-        }
++        let is_svg = path
++            .extension()
++            .and_then(|ext| ext.to_str())
++            .map(|ext| ext.eq_ignore_ascii_case("svg"))
++            .unwrap_or(false);
++
++        let (pixel_width, pixel_height, rgba) = if is_svg {
++            Self::load_svg(path)?
++        } else {
++            let decoded = image::open(path)
++                .map_err(|err| format!("画像を開けませんでした: {err}"))?
++                .to_rgba8();
++            let (pixel_width, pixel_height) = decoded.dimensions();
++            if pixel_width == 0 || pixel_height == 0 {
++                return Err("画像サイズが0です".to_owned());
++            }
++            (pixel_width, pixel_height, decoded.into_raw())
++        };
+ 
+         Ok(Self {
+             enabled: true,
+@@ -244,8 +255,52 @@
+             width_percent: 24.0,
+             pixel_width,
+             pixel_height,
+-            rgba: decoded.into_raw(),
++            rgba,
+         })
++    }
++
++    fn load_svg(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
++        const SVG_RASTER_MIN_LONG_EDGE: f32 = 1024.0;
++        const SVG_RASTER_MAX_LONG_EDGE: f32 = 2048.0;
++
++        let data = std::fs::read(path)
++            .map_err(|err| format!("SVGを読み込めませんでした: {err}"))?;
++
++        let mut options = resvg::usvg::Options::default();
++        options.fontdb_mut().load_system_fonts();
++
++        let tree = resvg::usvg::Tree::from_data(&data, &options)
++            .map_err(|err| format!("SVGを解析できませんでした: {err}"))?;
++
++        let size = tree.size();
++        let source_width = size.width();
++        let source_height = size.height();
++        if source_width <= 0.0 || source_height <= 0.0 {
++            return Err("SVGサイズが0です".to_owned());
++        }
++
++        // 現行の合成器はRGBAキャッシュを使うため、SVGは読み込み時に一度だけ
++        // 高解像度へラスタライズする。小さなSVGも長辺1024px程度まで引き上げ、
++        // 極端に大きいSVGは長辺2048pxに制限してメモリ使用量を抑える。
++        let source_long_edge = source_width.max(source_height);
++        let target_long_edge = source_long_edge
++            .clamp(SVG_RASTER_MIN_LONG_EDGE, SVG_RASTER_MAX_LONG_EDGE);
++        let scale = target_long_edge / source_long_edge;
++
++        let pixel_width = (source_width * scale).round().max(1.0) as u32;
++        let pixel_height = (source_height * scale).round().max(1.0) as u32;
++
++        let mut pixmap = resvg::tiny_skia::Pixmap::new(pixel_width, pixel_height)
++            .ok_or_else(|| "SVG描画バッファを作成できませんでした".to_owned())?;
++
++        let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
++        resvg::render(&tree, transform, &mut pixmap.as_mut());
++
++        // tiny-skia は premultiplied RGBA。燕の既存アルファ合成は straight RGBA
++        // を前提にしているため、ここで demultiply して既存PNG等と同じ形式に揃える。
++        let rgba = pixmap.take_demultiplied();
++
++        Ok((pixel_width, pixel_height, rgba))
+     }
+ 
+     pub fn aspect(&self) -> f32 {
+--- a/apps/tsubame/Cargo.toml
++++ b/apps/tsubame/Cargo.toml
+@@ -10,6 +10,7 @@
+ stream-recording = { path = "../../crates/stream-recording" }
+ eframe = "0.32"
+ image = "0.25"
++resvg = "0.48.1"
+ rfd = "0.15"
+ sysinfo = "0.38"
+ serde = { version = "1", features = ["derive"] }

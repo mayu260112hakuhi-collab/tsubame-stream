@@ -38,7 +38,7 @@ Diagnostics remain:
 Run on Windows:
 cargo test --workspace
 cargo check --workspace
-cargo run -p yaoyorozu-stream
+cargo run -p tsubame
 
 Test with same Genshin scene:
 1. Preview 15 FPS

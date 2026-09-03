@@ -1,6 +1,6 @@
 [package]
-name = "yaoyorozu-stream"
-version = "0.18.2"
+name = "tsubame-stream"
+version = "0.19.0"
 edition = "2021"
 
 [dependencies]
@@ -10,5 +10,12 @@ stream-audio = { path = "../../crates/stream-audio" }
 stream-recording = { path = "../../crates/stream-recording" }
 eframe = "0.32"
 image = "0.25"
+resvg = "0.48.1"
+rodio = "0.20"
 rfd = "0.15"
 sysinfo = "0.38"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+winres = "0.1"

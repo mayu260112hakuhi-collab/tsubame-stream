@@ -11,6 +11,6 @@ Yaoyorozu Stream Phase 9.1 — UI再構成
 Windows確認:
 cargo test --workspace
 cargo check --workspace
-cargo run -p yaoyorozu-stream
+cargo run -p tsubame
 
 生成環境にはcargoが無いため、RustコンパイルはWindows実機で確認してください。

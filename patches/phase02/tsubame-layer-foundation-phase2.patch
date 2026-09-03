@@ -1,0 +1,339 @@
+--- /mnt/data/scene.rs	2026-09-03 10:49:50.255854822 +0000
++++ /mnt/data/scene_phase2.rs	2026-09-03 10:51:02.518820858 +0000
+@@ -1,5 +1,56 @@
+ use std::path::{Path, PathBuf};
+ 
++
++pub type LayerId = u64;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum LayerKind {
++    FishOverlay,
++    Image,
++    Capture,
++    Camera,
++    Text,
++    Audio,
++    InputOverlay,
++    Browser,
++    Group,
++}
++
++impl LayerKind {
++    pub fn label(self) -> &'static str {
++        match self {
++            Self::FishOverlay => "テスト",
++            Self::Image => "画像",
++            Self::Capture => "キャプチャ",
++            Self::Camera => "カメラ",
++            Self::Text => "テキスト",
++            Self::Audio => "音声",
++            Self::InputOverlay => "入力表示",
++            Self::Browser => "Web",
++            Self::Group => "グループ",
++        }
++    }
++}
++
++#[derive(Debug, Clone)]
++pub struct SceneLayer {
++    pub id: LayerId,
++    pub kind: LayerKind,
++    pub name: String,
++    pub locked: bool,
++}
++
++impl SceneLayer {
++    pub fn new(id: LayerId, kind: LayerKind, name: impl Into<String>) -> Self {
++        Self {
++            id,
++            kind,
++            name: name.into(),
++            locked: false,
++        }
++    }
++}
++
+ #[derive(Debug, Clone)]
+ pub struct OverlaySource {
+     pub enabled: bool,
+--- /mnt/data/app.rs	2026-09-03 10:34:36.973169519 +0000
++++ /mnt/data/app_phase2.rs	2026-09-03 10:51:02.519140603 +0000
+@@ -1,5 +1,5 @@
+ use crate::addon::{AddonOrigin, AddonRegistry, ADDON_API_VERSION};
+-use crate::scene::{ImageOverlaySource, OverlaySource};
++use crate::scene::{ImageOverlaySource, LayerId, LayerKind, OverlaySource, SceneLayer};
+ use crate::settings::{load_settings, save_settings, AppSettings};
+ use crate::streaming::{StreamingPlatform, StreamingSession, StreamingTargetConfig};
+ use crate::ui_layout::{
+@@ -147,12 +147,6 @@
+     ExternalAddons,
+ }
+ 
+-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+-enum PreviewLayerSelection {
+-    Fish,
+-    Image,
+-}
+-
+ #[derive(Debug, Clone)]
+ struct MixerStripModel {
+     title: String,
+@@ -374,7 +368,11 @@
+     streaming_target: StreamingTargetConfig,
+     show_stream_key: bool,
+     overlay_source: OverlaySource,
+-    selected_preview_layer: Option<PreviewLayerSelection>,
++    layers: Vec<SceneLayer>,
++    selected_layer: Option<LayerId>,
++    next_layer_id: LayerId,
++    fish_layer_id: LayerId,
++    image_layer_id: Option<LayerId>,
+     preview_resize_drag: bool,
+     image_overlay: Option<ImageOverlaySource>,
+     image_overlay_message: String,
+@@ -394,6 +392,43 @@
+ }
+ 
+ impl YaoyorozuApp {
++    fn allocate_layer_id(&mut self) -> LayerId {
++        let id = self.next_layer_id;
++        self.next_layer_id = self.next_layer_id.saturating_add(1);
++        id
++    }
++
++    fn layer_locked(&self, id: LayerId) -> bool {
++        self.layers
++            .iter()
++            .find(|layer| layer.id == id)
++            .map(|layer| layer.locked)
++            .unwrap_or(false)
++    }
++
++    fn replace_image_layer(&mut self, name: String) -> LayerId {
++        if let Some(old_id) = self.image_layer_id.take() {
++            self.layers.retain(|layer| layer.id != old_id);
++            if self.selected_layer == Some(old_id) {
++                self.selected_layer = None;
++            }
++        }
++
++        let id = self.allocate_layer_id();
++        self.layers.push(SceneLayer::new(id, LayerKind::Image, name));
++        self.image_layer_id = Some(id);
++        id
++    }
++
++    fn remove_image_layer_metadata(&mut self) {
++        if let Some(id) = self.image_layer_id.take() {
++            self.layers.retain(|layer| layer.id != id);
++            if self.selected_layer == Some(id) {
++                self.selected_layer = None;
++            }
++        }
++    }
++
+     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+         apply_accessible_ui_style(&cc.egui_ctx);
+         let font_message = match install_windows_japanese_font(&cc.egui_ctx) {
+@@ -465,6 +500,15 @@
+         let first_run_open = !persisted_settings.first_run_complete;
+         let last_saved_settings = persisted_settings.clone();
+ 
++        // Layer foundation: keep the proven source implementations for now,
++        // but give every editable preview item a stable layer identity.
++        let fish_layer_id: LayerId = 1;
++        let layers = vec![SceneLayer::new(
++            fish_layer_id,
++            LayerKind::FishOverlay,
++            "ししゃも（テスト）",
++        )];
++
+         Self {
+             vm,
+             elapsed_ms: 0,
+@@ -492,7 +536,11 @@
+             streaming_target,
+             show_stream_key: false,
+             overlay_source: OverlaySource::default(),
+-            selected_preview_layer: None,
++            layers,
++            selected_layer: None,
++            next_layer_id: fish_layer_id + 1,
++            fish_layer_id,
++            image_layer_id: None,
+             preview_resize_drag: false,
+             image_overlay: None,
+             image_overlay_message: "画像オーバーレイ: 未追加".to_owned(),
+@@ -1127,6 +1175,7 @@
+             );
+ 
+             if self.overlay_source.enabled && self.preview_size[0] > 0 && self.preview_size[1] > 0 {
++                let fish_locked = self.layer_locked(self.fish_layer_id);
+                 let fish_w = image_rect.width() * self.overlay_source.width_percent / 100.0;
+                 let fish_h = fish_w * 0.42;
+                 let bounce = if self.overlay_source.bounce {
+@@ -1158,17 +1207,18 @@
+                 );
+ 
+                 if fish_response.clicked() {
+-                    self.selected_preview_layer = Some(PreviewLayerSelection::Fish);
++                    self.selected_layer = Some(self.fish_layer_id);
+                     overlay_interacted = true;
+                 }
+                 if fish_response.drag_started() {
+-                    self.selected_preview_layer = Some(PreviewLayerSelection::Fish);
++                    self.selected_layer = Some(self.fish_layer_id);
+                     overlay_interacted = true;
+-                    self.preview_resize_drag = ui
+-                        .ctx()
+-                        .pointer_interact_pos()
+-                        .map(|p| handle_rect.expand(5.0).contains(p))
+-                        .unwrap_or(false);
++                    self.preview_resize_drag = !fish_locked
++                        && ui
++                            .ctx()
++                            .pointer_interact_pos()
++                            .map(|p| handle_rect.expand(5.0).contains(p))
++                            .unwrap_or(false);
+                 }
+                 if fish_response.dragged() {
+                     overlay_interacted = true;
+@@ -1176,7 +1226,9 @@
+                     // Applying that value every repaint makes transform editing unstable.
+                     // Use the pointer's per-frame delta while this layer owns the drag.
+                     let delta = ui.ctx().input(|i| i.pointer.delta());
+-                    if self.preview_resize_drag {
++                    if fish_locked {
++                        // Locked layers can still be selected, but transforms are ignored.
++                    } else if self.preview_resize_drag {
+                         self.overlay_source.resize_by_preview_delta(
+                             delta.x,
+                             image_rect.width(),
+@@ -1198,7 +1250,7 @@
+                     self.preview_resize_drag = false;
+                 }
+ 
+-                if self.selected_preview_layer == Some(PreviewLayerSelection::Fish) {
++                if self.selected_layer == Some(self.fish_layer_id) {
+                     let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(100, 190, 255));
+                     ui.painter()
+                         .rect_stroke(fish_rect, 2.0, stroke, egui::StrokeKind::Outside);
+@@ -1210,6 +1262,10 @@
+                 }
+             }
+ 
++            let image_layer_id = self.image_layer_id;
++            let image_locked = image_layer_id
++                .map(|id| self.layer_locked(id))
++                .unwrap_or(false);
+             if let Some(image_overlay) = self.image_overlay.as_mut() {
+                 if image_overlay.enabled && self.preview_size[0] > 0 && self.preview_size[1] > 0 {
+                     let overlay_w = image_rect.width() * image_overlay.width_percent / 100.0;
+@@ -1233,22 +1289,29 @@
+                     );
+ 
+                     if image_response.clicked() {
+-                        self.selected_preview_layer = Some(PreviewLayerSelection::Image);
++                        if let Some(id) = image_layer_id {
++                            self.selected_layer = Some(id);
++                        }
+                         overlay_interacted = true;
+                     }
+                     if image_response.drag_started() {
+-                        self.selected_preview_layer = Some(PreviewLayerSelection::Image);
++                        if let Some(id) = image_layer_id {
++                            self.selected_layer = Some(id);
++                        }
+                         overlay_interacted = true;
+-                        self.preview_resize_drag = ui
+-                            .ctx()
+-                            .pointer_interact_pos()
+-                            .map(|p| handle_rect.expand(5.0).contains(p))
+-                            .unwrap_or(false);
++                        self.preview_resize_drag = !image_locked
++                            && ui
++                                .ctx()
++                                .pointer_interact_pos()
++                                .map(|p| handle_rect.expand(5.0).contains(p))
++                                .unwrap_or(false);
+                     }
+                     if image_response.dragged() {
+                         overlay_interacted = true;
+                         let delta = ui.ctx().input(|i| i.pointer.delta());
+-                        if self.preview_resize_drag {
++                        if image_locked {
++                            // Locked layers can still be selected, but transforms are ignored.
++                        } else if self.preview_resize_drag {
+                             image_overlay.resize_by_preview_delta(
+                                 delta.x,
+                                 image_rect.width(),
+@@ -1270,7 +1333,7 @@
+                         self.preview_resize_drag = false;
+                     }
+ 
+-                    if self.selected_preview_layer == Some(PreviewLayerSelection::Image) {
++                    if image_layer_id.is_some() && self.selected_layer == image_layer_id {
+                         let stroke =
+                             egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(130, 220, 140));
+                         ui.painter().rect_stroke(
+@@ -1291,7 +1354,7 @@
+             if outer_response.clicked() && !overlay_interacted {
+                 if let Some(pointer) = outer_response.interact_pointer_pos() {
+                     if image_rect.contains(pointer) {
+-                        self.selected_preview_layer = None;
++                        self.selected_layer = None;
+                         self.preview_resize_drag = false;
+                     }
+                 }
+@@ -1762,6 +1825,28 @@
+                     self.capture_source_panel(ui);
+                     ui.add_space(8.0);
+                     ui.separator();
++                    ui.heading("レイヤー");
++                    ui.small("上に表示される項目ほど手前。現在は選択とロックを先行実装しています。");
++                    let selected_layer = self.selected_layer;
++                    let mut select_layer = None;
++                    egui::Frame::group(ui.style()).show(ui, |ui| {
++                        for layer in self.layers.iter_mut().rev() {
++                            ui.horizontal(|ui| {
++                                let selected = selected_layer == Some(layer.id);
++                                let label = format!("{}  {}", layer.kind.label(), layer.name);
++                                if ui.selectable_label(selected, label).clicked() {
++                                    select_layer = Some(layer.id);
++                                }
++                                ui.checkbox(&mut layer.locked, "ロック");
++                            });
++                        }
++                    });
++                    if let Some(id) = select_layer {
++                        self.selected_layer = Some(id);
++                        self.preview_resize_drag = false;
++                    }
++
++                    ui.add_space(6.0);
+                     ui.heading("ソース / オーバーレイ");
+                     ui.horizontal_wrapped(|ui| {
+                         if ui.button("＋ 画像").clicked() {
+@@ -1776,8 +1861,9 @@
+                                             "画像: {} ({}×{})",
+                                             source.name, source.pixel_width, source.pixel_height
+                                         );
++                                        let layer_id = self.replace_image_layer(source.name.clone());
+                                         self.image_overlay = Some(source);
+-                                        self.selected_preview_layer = Some(PreviewLayerSelection::Image);
++                                        self.selected_layer = Some(layer_id);
+                                     }
+                                     Err(err) => {
+                                         self.image_overlay_message = format!("画像追加失敗: {err}");
+@@ -1835,9 +1921,7 @@
+                     }
+                     if remove_image_overlay {
+                         self.image_overlay = None;
+-                        if self.selected_preview_layer == Some(PreviewLayerSelection::Image) {
+-                            self.selected_preview_layer = None;
+-                        }
++                        self.remove_image_layer_metadata();
+                         self.preview_resize_drag = false;
+                         self.image_overlay_message = "画像オーバーレイ: 未追加".to_owned();
+                     }

@@ -1,28 +1,33 @@
 use crate::addon::{AddonOrigin, AddonRegistry, ADDON_API_VERSION};
-use crate::view_model::StreamViewModel;
+use crate::bgm::{BgmLayerSource, BgmPlayer};
+use crate::scene::{ImageOverlaySource, LayerId, LayerKind, OverlaySource, SceneLayer};
+use crate::settings::{load_settings, save_settings, AppSettings};
 use crate::streaming::{StreamingPlatform, StreamingSession, StreamingTargetConfig};
-use crate::scene::{ImageOverlaySource, OverlaySource};
 use crate::ui_layout::{
     compact_source_name, normal_preview_size, METER_GREEN_END_DB, METER_ORANGE_END_DB,
     METER_YELLOW_END_DB, SCENE_LABELS, SOURCE_SELECTOR_WIDTH,
 };
+use crate::view_model::StreamViewModel;
 use eframe::egui;
-use std::{fs, path::PathBuf, sync::mpsc, time::{Duration, Instant}};
-use stream_capture::{enumerate_windows, CaptureSource, CaptureWorker, PreviewMode, WindowInfo};
+use std::{
+    collections::HashMap,
+    fs,
+    path::PathBuf,
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 use stream_audio::{
     application_source_label, dbfs, selection_label, AudioChannelKind, AudioDeviceSelection,
     AudioWorker, ChannelMixerControl, MixerControl,
 };
-use stream_recording::{ffmpeg_location_string, EncoderPreference, RecordingConfig, RecordingPaths, RecordingSession};
+use stream_capture::{enumerate_windows, CaptureSource, CaptureWorker, PreviewMode, WindowInfo};
 use stream_core::{MarkerKind, StreamPreset};
+use stream_recording::{
+    ffmpeg_location_string, EncoderPreference, RecordingConfig, RecordingPaths, RecordingSession,
+};
 use sysinfo::System;
 
-pub fn fit_aspect(
-    source_w: f32,
-    source_h: f32,
-    available_w: f32,
-    available_h: f32,
-) -> (f32, f32) {
+pub fn fit_aspect(source_w: f32, source_h: f32, available_w: f32, available_h: f32) -> (f32, f32) {
     if source_w <= 0.0 || source_h <= 0.0 || available_w <= 0.0 || available_h <= 0.0 {
         return (0.0, 0.0);
     }
@@ -31,10 +36,7 @@ pub fn fit_aspect(
 }
 
 fn paint_audio_meter_vertical(ui: &mut egui::Ui, level: f32, height: f32) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(18.0, height),
-        egui::Sense::hover(),
-    );
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(18.0, height), egui::Sense::hover());
 
     let painter = ui.painter();
     painter.rect_filled(rect, 2.0, egui::Color32::from_rgb(35, 38, 43));
@@ -49,7 +51,11 @@ fn paint_audio_meter_vertical(ui: &mut egui::Ui, level: f32, height: f32) -> egu
     let segments = [
         (0.0, green_end, egui::Color32::from_rgb(55, 190, 95)),
         (green_end, yellow_end, egui::Color32::from_rgb(230, 205, 65)),
-        (yellow_end, orange_end, egui::Color32::from_rgb(235, 145, 50)),
+        (
+            yellow_end,
+            orange_end,
+            egui::Color32::from_rgb(235, 145, 50),
+        ),
         (orange_end, 1.0, egui::Color32::from_rgb(220, 65, 65)),
     ];
 
@@ -81,11 +87,21 @@ fn paint_audio_meter_vertical(ui: &mut egui::Ui, level: f32, height: f32) -> egu
 
 fn apply_accessible_ui_style(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
-    style.text_styles.insert(egui::TextStyle::Small, egui::FontId::proportional(14.0));
-    style.text_styles.insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
-    style.text_styles.insert(egui::TextStyle::Button, egui::FontId::proportional(15.0));
-    style.text_styles.insert(egui::TextStyle::Monospace, egui::FontId::monospace(14.0));
-    style.text_styles.insert(egui::TextStyle::Heading, egui::FontId::proportional(19.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Small, egui::FontId::proportional(14.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Body, egui::FontId::proportional(15.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Button, egui::FontId::proportional(15.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Monospace, egui::FontId::monospace(14.0));
+    style
+        .text_styles
+        .insert(egui::TextStyle::Heading, egui::FontId::proportional(19.0));
     style.spacing.button_padding = egui::vec2(8.0, 6.0);
     style.spacing.interact_size.y = 28.0;
     style.spacing.item_spacing = egui::vec2(8.0, 6.0);
@@ -132,7 +148,6 @@ enum SettingsPage {
     OfficialAddons,
     ExternalAddons,
 }
-
 
 #[derive(Debug, Clone)]
 struct MixerStripModel {
@@ -234,28 +249,22 @@ fn draw_mixer_channel_strip(ui: &mut egui::Ui, model: MixerStripModel) -> MixerS
                 egui::Layout::top_down(egui::Align::Center),
                 |ui| {
                     let mut muted = out_mute.unwrap_or(false);
-                    let mute_response = ui.add_enabled(
-                        out_mute.is_some(),
-                        egui::Checkbox::new(&mut muted, "Mute"),
-                    );
+                    let mute_response =
+                        ui.add_enabled(out_mute.is_some(), egui::Checkbox::new(&mut muted, "Mute"));
                     if mute_response.changed() {
                         out_mute = Some(muted);
                     }
 
                     let mut in_mix = out_mix.unwrap_or(false);
-                    let mix_response = ui.add_enabled(
-                        out_mix.is_some(),
-                        egui::Checkbox::new(&mut in_mix, "Mix"),
-                    );
+                    let mix_response =
+                        ui.add_enabled(out_mix.is_some(), egui::Checkbox::new(&mut in_mix, "Mix"));
                     if mix_response.changed() {
                         out_mix = Some(in_mix);
                     }
 
                     let mut wav = out_wav.unwrap_or(false);
-                    let wav_response = ui.add_enabled(
-                        out_wav.is_some(),
-                        egui::Checkbox::new(&mut wav, "WAV"),
-                    );
+                    let wav_response =
+                        ui.add_enabled(out_wav.is_some(), egui::Checkbox::new(&mut wav, "WAV"));
                     if wav_response.changed() {
                         out_wav = Some(wav);
                     }
@@ -263,10 +272,7 @@ fn draw_mixer_channel_strip(ui: &mut egui::Ui, model: MixerStripModel) -> MixerS
                     if model.removable {
                         remove_clicked = ui.small_button("削除").clicked();
                     } else {
-                        ui.add_sized(
-                            egui::vec2(inner_width, 20.0),
-                            egui::Label::new(""),
-                        );
+                        ui.add_sized(egui::vec2(inner_width, 20.0), egui::Label::new(""));
                     }
                 },
             );
@@ -334,6 +340,102 @@ impl PerformanceMonitor {
     }
 }
 
+
+fn bundle_subdir(name: &str) -> PathBuf {
+    let base = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join(name)
+}
+
+fn ensure_image_library_dir() -> PathBuf {
+    let root = bundle_subdir("image");
+    let _ = fs::create_dir_all(&root);
+    for child in ["background", "overlay", "wipe", "thumbnail"] {
+        let _ = fs::create_dir_all(root.join(child));
+    }
+    root
+}
+
+fn is_supported_library_image(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "png" | "jpg" | "jpeg" | "webp" | "bmp" | "svg"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn scan_image_library(root: &std::path::Path) -> Vec<PathBuf> {
+    fn visit(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, out);
+            } else if is_supported_library_image(&path) {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    visit(root, &mut files);
+    files.sort_by_key(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    });
+    files
+}
+
+fn ensure_bgm_library_dir() -> PathBuf {
+    let root = bundle_subdir("bgm");
+    let _ = fs::create_dir_all(&root);
+    root
+}
+
+fn is_supported_bgm(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "mp3" | "wav" | "ogg" | "flac"))
+        .unwrap_or(false)
+}
+
+fn scan_bgm_library(root: &std::path::Path) -> Vec<PathBuf> {
+    fn visit(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                visit(&path, out);
+            } else if is_supported_bgm(&path) {
+                out.push(path);
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    visit(root, &mut files);
+    files.sort_by_key(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    });
+    files
+}
+
 pub struct YaoyorozuApp {
     vm: StreamViewModel,
     elapsed_ms: u64,
@@ -364,12 +466,22 @@ pub struct YaoyorozuApp {
     streaming_target: StreamingTargetConfig,
     show_stream_key: bool,
     overlay_source: OverlaySource,
-    overlay_selected: bool,
-    overlay_resize_drag: bool,
-    image_overlay: Option<ImageOverlaySource>,
-    image_overlay_selected: bool,
-    image_overlay_resize_drag: bool,
+    layers: Vec<SceneLayer>,
+    selected_layer: Option<LayerId>,
+    next_layer_id: LayerId,
+    fish_layer_id: LayerId,
+    preview_resize_drag: bool,
+    image_overlays: Vec<(LayerId, ImageOverlaySource)>,
     image_overlay_message: String,
+    image_library_dir: PathBuf,
+    image_library_files: Vec<PathBuf>,
+    image_library_message: String,
+    bgm_layers: Vec<(LayerId, BgmLayerSource)>,
+    bgm_players: HashMap<LayerId, BgmPlayer>,
+    bgm_library_dir: PathBuf,
+    bgm_library_files: Vec<PathBuf>,
+    bgm_library_message: String,
+    bgm_message: String,
     app_started_at: std::time::Instant,
     streaming: Option<StreamingSession>,
     streaming_message: String,
@@ -378,9 +490,160 @@ pub struct YaoyorozuApp {
     settings_page: SettingsPage,
     addon_registry: AddonRegistry,
     external_addon_message: String,
+    persisted_settings: AppSettings,
+    last_saved_settings: AppSettings,
+    settings_save_message: String,
+    last_settings_save_at: Instant,
+    first_run_open: bool,
 }
 
 impl YaoyorozuApp {
+    fn allocate_layer_id(&mut self) -> LayerId {
+        let id = self.next_layer_id;
+        self.next_layer_id = self.next_layer_id.saturating_add(1);
+        id
+    }
+
+    fn layer_locked(&self, id: LayerId) -> bool {
+        self.layers
+            .iter()
+            .find(|layer| layer.id == id)
+            .map(|layer| layer.locked)
+            .unwrap_or(false)
+    }
+
+    fn move_layer_toward_front(&mut self, id: LayerId) {
+        let Some(index) = self.layers.iter().position(|layer| layer.id == id) else {
+            return;
+        };
+        if index + 1 < self.layers.len() {
+            self.layers.swap(index, index + 1);
+        }
+    }
+
+    fn move_layer_toward_back(&mut self, id: LayerId) {
+        let Some(index) = self.layers.iter().position(|layer| layer.id == id) else {
+            return;
+        };
+        if index > 0 {
+            self.layers.swap(index, index - 1);
+        }
+    }
+
+    fn add_image_layer(&mut self, source: ImageOverlaySource) -> LayerId {
+        let id = self.allocate_layer_id();
+        self.layers
+            .push(SceneLayer::new(id, LayerKind::Image, source.name.clone()));
+        self.image_overlays.push((id, source));
+        id
+    }
+
+    fn remove_image_layer(&mut self, id: LayerId) {
+        self.layers.retain(|layer| layer.id != id);
+        self.image_overlays.retain(|(layer_id, _)| *layer_id != id);
+        if self.selected_layer == Some(id) {
+            self.selected_layer = None;
+        }
+    }
+
+    fn add_bgm_layer(&mut self, source: BgmLayerSource) -> LayerId {
+        let id = self.allocate_layer_id();
+        self.layers
+            .push(SceneLayer::new(id, LayerKind::Audio, source.name.clone()));
+        self.bgm_layers.push((id, source));
+        id
+    }
+
+    fn remove_bgm_layer(&mut self, id: LayerId) {
+        if let Some(player) = self.bgm_players.remove(&id) {
+            player.stop();
+        }
+        self.layers.retain(|layer| layer.id != id);
+        self.bgm_layers.retain(|(layer_id, _)| *layer_id != id);
+        if self.selected_layer == Some(id) {
+            self.selected_layer = None;
+        }
+    }
+
+    fn refresh_bgm_library(&mut self) {
+        self.bgm_library_files = scan_bgm_library(&self.bgm_library_dir);
+        self.bgm_library_message = format!(
+            "BGMライブラリ: {} 曲 / {}",
+            self.bgm_library_files.len(),
+            self.bgm_library_dir.display()
+        );
+    }
+
+    fn add_bgm_from_path(&mut self, path: &std::path::Path) {
+        if !is_supported_bgm(path) {
+            self.bgm_message = "BGM追加失敗: 未対応の音声形式です".to_owned();
+            return;
+        }
+        let source = BgmLayerSource::from_path(path);
+        let name = source.name.clone();
+        let id = self.add_bgm_layer(source);
+        self.selected_layer = Some(id);
+        self.bgm_message = format!("BGM追加: {name} / 合計 {} 曲", self.bgm_layers.len());
+    }
+
+    fn play_bgm_layer(&mut self, id: LayerId) {
+        let Some((_, source)) = self.bgm_layers.iter().find(|(layer_id, _)| *layer_id == id) else {
+            return;
+        };
+        if !source.enabled {
+            self.bgm_message = "BGM再生: レイヤーが無効です".to_owned();
+            return;
+        }
+        let path = source.path.clone();
+        let loop_enabled = source.loop_enabled;
+        let volume = source.effective_volume();
+        let name = source.name.clone();
+        match BgmPlayer::play_file(&path, loop_enabled, volume) {
+            Ok(player) => {
+                if let Some(old) = self.bgm_players.insert(id, player) {
+                    old.stop();
+                }
+                self.bgm_message = format!("BGM再生中: {name}");
+            }
+            Err(err) => {
+                self.bgm_message = format!("BGM再生失敗: {err}");
+            }
+        }
+    }
+
+    fn refresh_image_library(&mut self) {
+        self.image_library_files = scan_image_library(&self.image_library_dir);
+        self.image_library_message = format!(
+            "画像ライブラリ: {} 素材 / {}",
+            self.image_library_files.len(),
+            self.image_library_dir.display()
+        );
+    }
+
+    fn add_image_from_path(&mut self, path: &std::path::Path) {
+        match ImageOverlaySource::load(path) {
+            Ok(mut source) => {
+                source.clamp_to_frame(self.preview_size[0], self.preview_size[1]);
+                let source_name = source.name.clone();
+                let pixel_width = source.pixel_width;
+                let pixel_height = source.pixel_height;
+                let layer_id = self.add_image_layer(source);
+                self.selected_layer = Some(layer_id);
+                self.preview_resize_drag = false;
+                self.image_overlay_message = format!(
+                    "画像追加: {} ({}×{}) / 合計 {} 枚",
+                    source_name,
+                    pixel_width,
+                    pixel_height,
+                    self.image_overlays.len()
+                );
+            }
+            Err(err) => {
+                self.image_overlay_message = format!("画像追加失敗: {err}");
+            }
+        }
+    }
+
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         apply_accessible_ui_style(&cc.egui_ctx);
         let font_message = match install_windows_japanese_font(&cc.egui_ctx) {
@@ -388,9 +651,36 @@ impl YaoyorozuApp {
             None => "Windows日本語フォントが見つかりません".to_owned(),
         };
 
+        let (persisted_settings, settings_save_message) = match load_settings() {
+            Ok(settings) => (settings, "設定: 読み込み済み".to_owned()),
+            Err(err) => (AppSettings::default(), format!("設定読み込み警告: {err}")),
+        };
+
+        let preset = match persisted_settings.preset.as_str() {
+            "work" => StreamPreset::Work,
+            "light" => StreamPreset::Light,
+            _ => StreamPreset::Game,
+        };
+        let encoder_preference = match persisted_settings.encoder_preference.as_str() {
+            "auto" => EncoderPreference::Auto,
+            "nvenc" => EncoderPreference::Nvenc,
+            "qsv" => EncoderPreference::QuickSync,
+            "cpu" => EncoderPreference::Cpu,
+            _ => EncoderPreference::Amf,
+        };
+        let recording_preview_mode = match persisted_settings.recording_preview_mode.as_str() {
+            "fps30" => PreviewMode::Fps30,
+            "off" => PreviewMode::Off,
+            _ => PreviewMode::Fps15,
+        };
+        let streaming_platform = match persisted_settings.streaming_platform.as_str() {
+            "twitch" => StreamingPlatform::Twitch,
+            _ => StreamingPlatform::YouTube,
+        };
+
         let windows = enumerate_windows().unwrap_or_default();
         let selected_source = CaptureSource::Desktop;
-        let capture_target_fps = StreamPreset::Game.dimensions().2;
+        let capture_target_fps = preset.dimensions().2;
 
         let (capture, capture_message) =
             match CaptureWorker::start(selected_source.clone(), capture_target_fps) {
@@ -402,12 +692,55 @@ impl YaoyorozuApp {
             };
 
         let (audio, audio_message) = match AudioWorker::start_default_devices() {
-            Ok(worker) => (Some(worker), "WASAPI音声メーター: 稼働中".to_owned()),
+            Ok(worker) => {
+                if let Some(id) = persisted_settings.output_device_id.clone() {
+                    worker.set_output_device(AudioDeviceSelection::DeviceId(id));
+                }
+                if let Some(id) = persisted_settings.input_device_id.clone() {
+                    worker.set_input_device(AudioDeviceSelection::DeviceId(id));
+                }
+                (Some(worker), "WASAPI音声メーター: 稼働中".to_owned())
+            }
             Err(err) => (None, format!("音声開始失敗: {err}")),
         };
 
+        let mut vm = StreamViewModel::default();
+        vm.set_preset(preset);
+        let mut streaming_target = StreamingTargetConfig::new(streaming_platform);
+        streaming_target.server_url = persisted_settings.streaming_server_url.clone();
+        streaming_target.video_bitrate_kbps =
+            persisted_settings.streaming_video_bitrate_kbps.max(500);
+        // ストリームキーは平文保存しない。起動ごとに入力する。
+        streaming_target.stream_key.clear();
+        let first_run_open = !persisted_settings.first_run_complete;
+        let last_saved_settings = persisted_settings.clone();
+
+        // Layer foundation: keep the proven source implementations for now,
+        // but give every editable preview item a stable layer identity.
+        let fish_layer_id: LayerId = 1;
+        let layers = vec![SceneLayer::new(
+            fish_layer_id,
+            LayerKind::FishOverlay,
+            "ししゃも（テスト）",
+        )];
+
+        let image_library_dir = ensure_image_library_dir();
+        let image_library_files = scan_image_library(&image_library_dir);
+        let image_library_message = format!(
+            "画像ライブラリ: {} 枚 / {}",
+            image_library_files.len(),
+            image_library_dir.display()
+        );
+        let bgm_library_dir = ensure_bgm_library_dir();
+        let bgm_library_files = scan_bgm_library(&bgm_library_dir);
+        let bgm_library_message = format!(
+            "BGMライブラリ: {} 曲 / {}",
+            bgm_library_files.len(),
+            bgm_library_dir.display()
+        );
+
         Self {
-            vm: StreamViewModel::default(),
+            vm,
             elapsed_ms: 0,
             stream_title: "燕 / Tsubame".to_owned(),
             windows,
@@ -416,7 +749,7 @@ impl YaoyorozuApp {
             capture_target_fps,
             preview_texture: None,
             preview_size: [0, 0],
-            preview_window_open: true,
+            preview_window_open: persisted_settings.preview_window_open,
             capture_message,
             font_message,
             audio,
@@ -427,18 +760,28 @@ impl YaoyorozuApp {
             finalize_rx: None,
             recording_message: "録画: 待機中".to_owned(),
             ffmpeg_location: ffmpeg_location_string(),
-            encoder_preference: EncoderPreference::Amf,
-            recording_preview_mode: PreviewMode::Fps15,
+            encoder_preference,
+            recording_preview_mode,
             capture_preview_mode: PreviewMode::Fps30,
-            streaming_target: StreamingTargetConfig::default(),
+            streaming_target,
             show_stream_key: false,
             overlay_source: OverlaySource::default(),
-            overlay_selected: false,
-            overlay_resize_drag: false,
-            image_overlay: None,
-            image_overlay_selected: false,
-            image_overlay_resize_drag: false,
+            layers,
+            selected_layer: None,
+            next_layer_id: fish_layer_id + 1,
+            fish_layer_id,
+            preview_resize_drag: false,
+            image_overlays: Vec::new(),
             image_overlay_message: "画像オーバーレイ: 未追加".to_owned(),
+            image_library_dir,
+            image_library_files,
+            image_library_message,
+            bgm_layers: Vec::new(),
+            bgm_players: HashMap::new(),
+            bgm_library_dir,
+            bgm_library_files,
+            bgm_library_message,
+            bgm_message: "BGM: 未追加".to_owned(),
             app_started_at: std::time::Instant::now(),
             streaming: None,
             streaming_message: "配信: 待機中".to_owned(),
@@ -447,7 +790,101 @@ impl YaoyorozuApp {
             settings_page: SettingsPage::General,
             addon_registry: AddonRegistry::new(),
             external_addon_message: "外部アドオン: 未追加".to_owned(),
+            persisted_settings,
+            last_saved_settings,
+            settings_save_message,
+            last_settings_save_at: Instant::now(),
+            first_run_open,
         }
+    }
+
+    fn collect_persisted_settings(&self) -> AppSettings {
+        let mut settings = self.persisted_settings.clone();
+        settings.preset = match self.vm.session.preset {
+            StreamPreset::Game => "game",
+            StreamPreset::Work => "work",
+            StreamPreset::Light => "light",
+        }
+        .to_owned();
+        settings.encoder_preference = match self.encoder_preference {
+            EncoderPreference::Auto => "auto",
+            EncoderPreference::Nvenc => "nvenc",
+            EncoderPreference::Amf => "amf",
+            EncoderPreference::QuickSync => "qsv",
+            EncoderPreference::Cpu => "cpu",
+        }
+        .to_owned();
+        settings.recording_preview_mode = match self.recording_preview_mode {
+            PreviewMode::Fps30 => "fps30",
+            PreviewMode::Fps15 => "fps15",
+            PreviewMode::Off => "off",
+        }
+        .to_owned();
+        settings.streaming_platform = match self.streaming_target.platform {
+            StreamingPlatform::YouTube => "youtube",
+            StreamingPlatform::Twitch => "twitch",
+        }
+        .to_owned();
+        settings.streaming_server_url = self.streaming_target.server_url.clone();
+        settings.streaming_video_bitrate_kbps = self.streaming_target.video_bitrate_kbps;
+        settings.preview_window_open = self.preview_window_open;
+
+        if let Some(audio) = &self.audio {
+            settings.input_device_id = match audio.selected_input_device() {
+                AudioDeviceSelection::Default => None,
+                AudioDeviceSelection::DeviceId(id) => Some(id),
+            };
+            settings.output_device_id = match audio.selected_output_device() {
+                AudioDeviceSelection::Default => None,
+                AudioDeviceSelection::DeviceId(id) => Some(id),
+            };
+        }
+        settings
+    }
+
+    fn save_settings_if_due(&mut self) {
+        if self.last_settings_save_at.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_settings_save_at = Instant::now();
+        let current = self.collect_persisted_settings();
+        if current == self.last_saved_settings {
+            return;
+        }
+        match save_settings(&current) {
+            Ok(path) => {
+                self.settings_save_message = format!("設定保存: {}", path.display());
+                self.persisted_settings = current.clone();
+                self.last_saved_settings = current;
+            }
+            Err(err) => {
+                self.settings_save_message = format!("設定保存失敗: {err}");
+            }
+        }
+    }
+
+    fn show_first_run_window(&mut self, ctx: &egui::Context) {
+        if !self.first_run_open {
+            return;
+        }
+        egui::Window::new("燕へようこそ")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.heading("燕 / Tsubame");
+                ui.label("軽量・安定を優先した配信／録画ソフトです。");
+                ui.add_space(6.0);
+                ui.label("設定は自動保存され、次回起動時に復元されます。");
+                ui.label("安全のためストリームキーだけは平文保存しません。");
+                ui.label("配信前に設定画面で音声デバイスと配信先を確認してください。");
+                ui.add_space(10.0);
+                if ui.button("はじめる").clicked() {
+                    self.first_run_open = false;
+                    self.persisted_settings.first_run_complete = true;
+                    self.last_settings_save_at = Instant::now() - Duration::from_secs(2);
+                }
+            });
     }
 
     fn set_stream_preset(&mut self, preset: StreamPreset) {
@@ -468,8 +905,7 @@ impl YaoyorozuApp {
         match enumerate_windows() {
             Ok(windows) => {
                 self.windows = windows;
-                self.capture_message =
-                    format!("ウィンドウ一覧を更新: {} 件", self.windows.len());
+                self.capture_message = format!("ウィンドウ一覧を更新: {} 件", self.windows.len());
             }
             Err(err) => {
                 self.capture_message = format!("ウィンドウ一覧取得失敗: {err}");
@@ -534,7 +970,11 @@ impl YaoyorozuApp {
         }
 
         if let Some(capture) = &self.capture {
-            if capture.gpu_recording_handle().set_preview_mode(desired).is_ok() {
+            if capture
+                .gpu_recording_handle()
+                .set_preview_mode(desired)
+                .is_ok()
+            {
                 self.capture_preview_mode = desired;
             }
         }
@@ -564,24 +1004,45 @@ impl YaoyorozuApp {
             return;
         }
 
-        let overlay_enabled = self.overlay_source.enabled
-            || self
-                .image_overlay
-                .as_ref()
-                .is_some_and(|overlay| overlay.enabled);
+        let overlay_enabled = self.layers.iter().any(|layer| match layer.kind {
+            LayerKind::FishOverlay if layer.id == self.fish_layer_id => self.overlay_source.enabled,
+            LayerKind::Image => self
+                .image_overlays
+                .iter()
+                .find(|(id, _)| *id == layer.id)
+                .is_some_and(|(_, overlay)| overlay.enabled),
+            _ => false,
+        });
 
         // Keep the original Arc-backed capture frame whenever no overlay is
         // active. This removes one full 960x540 RGBA allocation/copy per frame.
+        //
+        // `self.layers` is stored back-to-front. Composing in vector order
+        // therefore makes the last item the visible front layer, matching the
+        // layer list UI (which displays the vector in reverse).
         let composed_frame = if overlay_enabled {
             let mut composed_rgba = frame.rgba.to_vec();
-            self.overlay_source.compose_test_overlay(
-                &mut composed_rgba,
-                frame.width,
-                frame.height,
-                self.app_started_at.elapsed().as_secs_f32(),
-            );
-            if let Some(image_overlay) = &self.image_overlay {
-                image_overlay.compose(&mut composed_rgba, frame.width, frame.height);
+            for layer in &self.layers {
+                match layer.kind {
+                    LayerKind::FishOverlay if layer.id == self.fish_layer_id => {
+                        self.overlay_source.compose_test_overlay(
+                            &mut composed_rgba,
+                            frame.width,
+                            frame.height,
+                            self.app_started_at.elapsed().as_secs_f32(),
+                        );
+                    }
+                    LayerKind::Image => {
+                        if let Some((_, image_overlay)) = self
+                            .image_overlays
+                            .iter()
+                            .find(|(id, _)| *id == layer.id)
+                        {
+                            image_overlay.compose(&mut composed_rgba, frame.width, frame.height);
+                        }
+                    }
+                    _ => {}
+                }
             }
             stream_capture::CaptureFrame {
                 sequence: frame.sequence,
@@ -604,21 +1065,20 @@ impl YaoyorozuApp {
         }
 
         let image = egui::ColorImage::from_rgba_unmultiplied(
-            [composed_frame.width as usize, composed_frame.height as usize],
+            [
+                composed_frame.width as usize,
+                composed_frame.height as usize,
+            ],
             &composed_frame.rgba,
         );
 
         if let Some(texture) = &mut self.preview_texture {
             texture.set(image, egui::TextureOptions::LINEAR);
         } else {
-            self.preview_texture = Some(ctx.load_texture(
-                "capture-preview",
-                image,
-                egui::TextureOptions::LINEAR,
-            ));
+            self.preview_texture =
+                Some(ctx.load_texture("capture-preview", image, egui::TextureOptions::LINEAR));
         }
     }
-
 
     fn start_recording(&mut self) {
         if self.recording.is_some() || self.finalize_rx.is_some() {
@@ -702,8 +1162,7 @@ impl YaoyorozuApp {
 
         match rx.try_recv() {
             Ok(Ok(paths)) => {
-                self.recording_message =
-                    format!("録画完了: {}", paths.final_video.display());
+                self.recording_message = format!("録画完了: {}", paths.final_video.display());
                 self.finalize_rx = None;
             }
             Ok(Err(err)) => {
@@ -733,7 +1192,10 @@ impl YaoyorozuApp {
             },
             None => None,
         };
-        let live_audio_count = live_audio.as_ref().map(|bridge| bridge.inputs.len()).unwrap_or(0);
+        let live_audio_count = live_audio
+            .as_ref()
+            .map(|bridge| bridge.inputs.len())
+            .unwrap_or(0);
         match StreamingSession::start(
             &self.streaming_target,
             self.preview_size[0],
@@ -778,9 +1240,8 @@ impl YaoyorozuApp {
         match streaming.try_exit() {
             Ok(Some(status)) => {
                 let diagnostic = streaming.diagnostic_summary();
-                self.streaming_message = format!(
-                    "配信プロセス終了: {status} / FFmpeg: {diagnostic}"
-                );
+                self.streaming_message =
+                    format!("配信プロセス終了: {status} / FFmpeg: {diagnostic}");
                 self.streaming = None;
                 self.vm.is_live = false;
             }
@@ -887,9 +1348,18 @@ impl YaoyorozuApp {
             .show(ui, |ui| {
                 if let Some(capture) = &self.capture {
                     let stats = capture.stats();
-                    ui.small(format!("WGC callback: {:.1} FPS / frames {}", stats.measured_fps, stats.received_frames));
-                    ui.small(format!("540p async readback: avg {:.2} ms / max {:.2} ms", stats.gpu_to_cpu_ms_avg, stats.gpu_to_cpu_ms_max));
-                    ui.small(format!("Preview worker frames: {} / jobs dropped: {}", stats.preview_worker_frames, stats.preview_jobs_dropped));
+                    ui.small(format!(
+                        "WGC callback: {:.1} FPS / frames {}",
+                        stats.measured_fps, stats.received_frames
+                    ));
+                    ui.small(format!(
+                        "540p async readback: avg {:.2} ms / max {:.2} ms",
+                        stats.gpu_to_cpu_ms_avg, stats.gpu_to_cpu_ms_max
+                    ));
+                    ui.small(format!(
+                        "Preview worker frames: {} / jobs dropped: {}",
+                        stats.preview_worker_frames, stats.preview_jobs_dropped
+                    ));
                 }
                 ui.separator();
                 ui.small(format!("FFmpeg: {}", self.ffmpeg_location));
@@ -906,24 +1376,45 @@ impl YaoyorozuApp {
                                 PreviewMode::Off => "OFF",
                             })
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.recording_preview_mode, PreviewMode::Fps15, "15 FPS（推奨）");
-                                ui.selectable_value(&mut self.recording_preview_mode, PreviewMode::Off, "OFF（最軽量）");
-                                ui.selectable_value(&mut self.recording_preview_mode, PreviewMode::Fps30, "30 FPS");
+                                ui.selectable_value(
+                                    &mut self.recording_preview_mode,
+                                    PreviewMode::Fps15,
+                                    "15 FPS（推奨）",
+                                );
+                                ui.selectable_value(
+                                    &mut self.recording_preview_mode,
+                                    PreviewMode::Off,
+                                    "OFF（最軽量）",
+                                );
+                                ui.selectable_value(
+                                    &mut self.recording_preview_mode,
+                                    PreviewMode::Fps30,
+                                    "30 FPS",
+                                );
                             });
                     });
                 }
 
                 if let Some(recording) = &self.recording {
-                    ui.small(format!("GPU encoded frames: {} / status: {:?}", recording.encoded_frames(), recording.gpu_status()));
+                    ui.small(format!(
+                        "GPU encoded frames: {} / status: {:?}",
+                        recording.encoded_frames(),
+                        recording.gpu_status()
+                    ));
                 }
             });
     }
 
-
-    fn draw_preview_canvas(&mut self, ui: &mut egui::Ui, outer_size: egui::Vec2, compact_info: bool) {
+    fn draw_preview_canvas(
+        &mut self,
+        ui: &mut egui::Ui,
+        outer_size: egui::Vec2,
+        compact_info: bool,
+    ) {
         let desired = egui::vec2(outer_size.x.max(120.0), outer_size.y.max(120.0));
         let (outer, outer_response) = ui.allocate_exact_size(desired, egui::Sense::click());
-        ui.painter().rect_filled(outer, 4.0, egui::Color32::from_rgb(18, 20, 24));
+        ui.painter()
+            .rect_filled(outer, 4.0, egui::Color32::from_rgb(18, 20, 24));
 
         let mut overlay_interacted = false;
         if let Some(texture) = &self.preview_texture {
@@ -933,7 +1424,8 @@ impl YaoyorozuApp {
                 outer.width(),
                 outer.height(),
             );
-            let image_rect = egui::Rect::from_center_size(outer.center(), egui::vec2(draw_w, draw_h));
+            let image_rect =
+                egui::Rect::from_center_size(outer.center(), egui::vec2(draw_w, draw_h));
             ui.painter().image(
                 texture.id(),
                 image_rect,
@@ -942,10 +1434,13 @@ impl YaoyorozuApp {
             );
 
             if self.overlay_source.enabled && self.preview_size[0] > 0 && self.preview_size[1] > 0 {
+                let fish_locked = self.layer_locked(self.fish_layer_id);
                 let fish_w = image_rect.width() * self.overlay_source.width_percent / 100.0;
                 let fish_h = fish_w * 0.42;
                 let bounce = if self.overlay_source.bounce {
-                    (self.app_started_at.elapsed().as_secs_f32() * 4.2).sin().abs()
+                    (self.app_started_at.elapsed().as_secs_f32() * 4.2)
+                        .sin()
+                        .abs()
                         * image_rect.height()
                         * 0.055
                 } else {
@@ -953,7 +1448,8 @@ impl YaoyorozuApp {
                 };
                 let center = egui::pos2(
                     image_rect.left() + image_rect.width() * self.overlay_source.x_percent / 100.0,
-                    image_rect.top() + image_rect.height() * self.overlay_source.y_percent / 100.0 - bounce,
+                    image_rect.top() + image_rect.height() * self.overlay_source.y_percent / 100.0
+                        - bounce,
                 );
                 let fish_rect = egui::Rect::from_center_size(center, egui::vec2(fish_w, fish_h));
                 let hit_rect = fish_rect.expand(5.0).intersect(image_rect);
@@ -970,24 +1466,28 @@ impl YaoyorozuApp {
                 );
 
                 if fish_response.clicked() {
-                    self.overlay_selected = true;
-                    self.image_overlay_selected = false;
+                    self.selected_layer = Some(self.fish_layer_id);
                     overlay_interacted = true;
                 }
                 if fish_response.drag_started() {
-                    self.overlay_selected = true;
-                    self.image_overlay_selected = false;
+                    self.selected_layer = Some(self.fish_layer_id);
                     overlay_interacted = true;
-                    self.overlay_resize_drag = ui
-                        .ctx()
-                        .pointer_interact_pos()
-                        .map(|p| handle_rect.expand(5.0).contains(p))
-                        .unwrap_or(false);
+                    self.preview_resize_drag = !fish_locked
+                        && ui
+                            .ctx()
+                            .pointer_interact_pos()
+                            .map(|p| handle_rect.expand(5.0).contains(p))
+                            .unwrap_or(false);
                 }
                 if fish_response.dragged() {
                     overlay_interacted = true;
-                    let delta = fish_response.drag_delta();
-                    if self.overlay_resize_drag {
+                    // egui::Response::drag_delta() is cumulative from drag start.
+                    // Applying that value every repaint makes transform editing unstable.
+                    // Use the pointer's per-frame delta while this layer owns the drag.
+                    let delta = ui.ctx().input(|i| i.pointer.delta());
+                    if fish_locked {
+                        // Locked layers can still be selected, but transforms are ignored.
+                    } else if self.preview_resize_drag {
                         self.overlay_source.resize_by_preview_delta(
                             delta.x,
                             image_rect.width(),
@@ -1006,17 +1506,13 @@ impl YaoyorozuApp {
                     }
                 }
                 if fish_response.drag_stopped() {
-                    self.overlay_resize_drag = false;
+                    self.preview_resize_drag = false;
                 }
 
-                if self.overlay_selected {
+                if self.selected_layer == Some(self.fish_layer_id) {
                     let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(100, 190, 255));
-                    ui.painter().rect_stroke(
-                        fish_rect,
-                        2.0,
-                        stroke,
-                        egui::StrokeKind::Outside,
-                    );
+                    ui.painter()
+                        .rect_stroke(fish_rect, 2.0, stroke, egui::StrokeKind::Outside);
                     ui.painter().rect_filled(
                         handle_rect,
                         1.0,
@@ -1025,97 +1521,111 @@ impl YaoyorozuApp {
                 }
             }
 
-            if let Some(image_overlay) = self.image_overlay.as_mut() {
-                if image_overlay.enabled && self.preview_size[0] > 0 && self.preview_size[1] > 0 {
-                    let overlay_w = image_rect.width() * image_overlay.width_percent / 100.0;
-                    let overlay_h = overlay_w * image_overlay.aspect();
-                    let center = egui::pos2(
-                        image_rect.left() + image_rect.width() * image_overlay.x_percent / 100.0,
-                        image_rect.top() + image_rect.height() * image_overlay.y_percent / 100.0,
-                    );
-                    let overlay_rect = egui::Rect::from_center_size(
-                        center,
-                        egui::vec2(overlay_w, overlay_h),
-                    );
-                    let hit_rect = overlay_rect.expand(5.0).intersect(image_rect);
-                    let image_response = ui.interact(
-                        hit_rect,
-                        ui.id().with("overlay_image_drag"),
-                        egui::Sense::click_and_drag(),
-                    );
-                    let handle_size = 12.0;
-                    let handle_rect = egui::Rect::from_center_size(
-                        overlay_rect.right_bottom(),
-                        egui::vec2(handle_size, handle_size),
-                    );
+            let image_layer_ids: Vec<LayerId> = self
+                .layers
+                .iter()
+                .rev()
+                .filter(|layer| layer.kind == LayerKind::Image)
+                .map(|layer| layer.id)
+                .collect();
 
-                    if image_response.clicked() {
-                        self.image_overlay_selected = true;
-                        self.overlay_selected = false;
-                        overlay_interacted = true;
-                    }
-                    if image_response.drag_started() {
-                        self.image_overlay_selected = true;
-                        self.overlay_selected = false;
-                        overlay_interacted = true;
-                        self.image_overlay_resize_drag = ui
+            for image_layer_id in image_layer_ids {
+                let image_locked = self.layer_locked(image_layer_id);
+                let Some(image_index) = self
+                    .image_overlays
+                    .iter()
+                    .position(|(id, _)| *id == image_layer_id)
+                else {
+                    continue;
+                };
+                let image_overlay = &mut self.image_overlays[image_index].1;
+                if !image_overlay.enabled || self.preview_size[0] == 0 || self.preview_size[1] == 0 {
+                    continue;
+                }
+
+                let overlay_w = image_rect.width() * image_overlay.width_percent / 100.0;
+                let overlay_h = overlay_w * image_overlay.aspect();
+                let center = egui::pos2(
+                    image_rect.left() + image_rect.width() * image_overlay.x_percent / 100.0,
+                    image_rect.top() + image_rect.height() * image_overlay.y_percent / 100.0,
+                );
+                let overlay_rect =
+                    egui::Rect::from_center_size(center, egui::vec2(overlay_w, overlay_h));
+                let hit_rect = overlay_rect.expand(5.0).intersect(image_rect);
+                let image_response = ui.interact(
+                    hit_rect,
+                    ui.id().with(("overlay_image_drag", image_layer_id)),
+                    egui::Sense::click_and_drag(),
+                );
+                let handle_size = 12.0;
+                let handle_rect = egui::Rect::from_center_size(
+                    overlay_rect.right_bottom(),
+                    egui::vec2(handle_size, handle_size),
+                );
+
+                if image_response.clicked() {
+                    self.selected_layer = Some(image_layer_id);
+                    overlay_interacted = true;
+                }
+                if image_response.drag_started() {
+                    self.selected_layer = Some(image_layer_id);
+                    overlay_interacted = true;
+                    self.preview_resize_drag = !image_locked
+                        && ui
                             .ctx()
                             .pointer_interact_pos()
                             .map(|p| handle_rect.expand(5.0).contains(p))
                             .unwrap_or(false);
+                }
+                if image_response.dragged() {
+                    overlay_interacted = true;
+                    let delta = ui.ctx().input(|i| i.pointer.delta());
+                    if image_locked {
+                        // Locked layers can still be selected, but transforms are ignored.
+                    } else if self.preview_resize_drag {
+                        image_overlay.resize_by_preview_delta(
+                            delta.x,
+                            image_rect.width(),
+                            self.preview_size[0],
+                            self.preview_size[1],
+                        );
+                    } else {
+                        image_overlay.move_by_preview_delta(
+                            delta.x,
+                            delta.y,
+                            image_rect.width(),
+                            image_rect.height(),
+                            self.preview_size[0],
+                            self.preview_size[1],
+                        );
                     }
-                    if image_response.dragged() {
-                        overlay_interacted = true;
-                        let delta = image_response.drag_delta();
-                        if self.image_overlay_resize_drag {
-                            image_overlay.resize_by_preview_delta(
-                                delta.x,
-                                image_rect.width(),
-                                self.preview_size[0],
-                                self.preview_size[1],
-                            );
-                        } else {
-                            image_overlay.move_by_preview_delta(
-                                delta.x,
-                                delta.y,
-                                image_rect.width(),
-                                image_rect.height(),
-                                self.preview_size[0],
-                                self.preview_size[1],
-                            );
-                        }
-                    }
-                    if image_response.drag_stopped() {
-                        self.image_overlay_resize_drag = false;
-                    }
+                }
+                if image_response.drag_stopped() {
+                    self.preview_resize_drag = false;
+                }
 
-                    if self.image_overlay_selected {
-                        let stroke = egui::Stroke::new(
-                            1.5_f32,
-                            egui::Color32::from_rgb(130, 220, 140),
-                        );
-                        ui.painter().rect_stroke(
-                            overlay_rect,
-                            2.0,
-                            stroke,
-                            egui::StrokeKind::Outside,
-                        );
-                        ui.painter().rect_filled(
-                            handle_rect,
-                            1.0,
-                            egui::Color32::from_rgb(130, 220, 140),
-                        );
-                    }
+                if self.selected_layer == Some(image_layer_id) {
+                    let stroke =
+                        egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(130, 220, 140));
+                    ui.painter().rect_stroke(
+                        overlay_rect,
+                        2.0,
+                        stroke,
+                        egui::StrokeKind::Outside,
+                    );
+                    ui.painter().rect_filled(
+                        handle_rect,
+                        1.0,
+                        egui::Color32::from_rgb(130, 220, 140),
+                    );
                 }
             }
 
             if outer_response.clicked() && !overlay_interacted {
                 if let Some(pointer) = outer_response.interact_pointer_pos() {
                     if image_rect.contains(pointer) {
-                        self.overlay_selected = false;
-                        self.overlay_resize_drag = false;
-                        self.image_overlay_selected = false;
-                        self.image_overlay_resize_drag = false;
+                        self.selected_layer = None;
+                        self.preview_resize_drag = false;
                     }
                 }
             }
@@ -1130,9 +1640,15 @@ impl YaoyorozuApp {
         }
 
         if compact_info {
-            ui.small(format!("入力 {}×{} / プレビュー窓でドラッグ編集", self.preview_size[0], self.preview_size[1]));
+            ui.small(format!(
+                "入力 {}×{} / プレビュー窓でドラッグ編集",
+                self.preview_size[0], self.preview_size[1]
+            ));
         } else {
-            ui.small(format!("プレビュー別窓 / 入力 {}×{} / 画像・ししゃものドラッグ編集対応", self.preview_size[0], self.preview_size[1]));
+            ui.small(format!(
+                "プレビュー別窓 / 入力 {}×{} / 画像・ししゃものドラッグ編集対応",
+                self.preview_size[0], self.preview_size[1]
+            ));
         }
     }
 
@@ -1225,6 +1741,13 @@ impl YaoyorozuApp {
                             });
                             ui.add_space(8.0);
                             ui.group(|ui| {
+                                ui.label("設定保存");
+                                ui.small("主要設定は自動保存し、次回起動時に復元します。");
+                                ui.small("ストリームキーは安全のため平文保存しません。");
+                                ui.small(&self.settings_save_message);
+                            });
+                            ui.add_space(8.0);
+                            ui.group(|ui| {
                                 ui.label("設計方針");
                                 ui.small("コアと公開Addon APIを分離し、内部更新でアドオンが壊れにくい構成を目指します。");
                             });
@@ -1312,12 +1835,11 @@ impl YaoyorozuApp {
 
         self.settings_open = open;
     }
-
-
 }
 
 impl eframe::App for YaoyorozuApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.bgm_players.retain(|_, player| !player.is_finished());
         self.poll_recording_finalize();
         self.poll_streaming();
         self.performance.refresh_if_due();
@@ -1325,6 +1847,8 @@ impl eframe::App for YaoyorozuApp {
         self.update_preview_texture(ctx);
         self.show_preview_viewport(ctx);
         self.show_settings_window(ctx);
+        self.show_first_run_window(ctx);
+        self.save_settings_if_due();
 
         egui::TopBottomPanel::top("tsubame_top_toolbar")
             .exact_height(38.0)
@@ -1390,7 +1914,11 @@ impl eframe::App for YaoyorozuApp {
                 ui.separator();
                 ui.label(self.streaming_target.connection_label());
                 ui.separator();
-                ui.label(if self.streaming.is_some() { "● 送信中" } else { "○ OFFLINE" });
+                ui.label(if self.streaming.is_some() {
+                    "● 送信中"
+                } else {
+                    "○ OFFLINE"
+                });
             });
         });
 
@@ -1568,48 +2096,318 @@ impl eframe::App for YaoyorozuApp {
                     self.capture_source_panel(ui);
                     ui.add_space(8.0);
                     ui.separator();
+                    ui.heading("レイヤー");
+                    ui.small("上に表示される項目ほど手前。順番はプレビュー・配信映像の合成順にも反映されます。");
+                    let selected_layer = self.selected_layer;
+                    let mut select_layer = None;
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        for layer in self.layers.iter_mut().rev() {
+                            ui.horizontal(|ui| {
+                                let selected = selected_layer == Some(layer.id);
+                                let label = format!("{}  {}", layer.kind.label(), layer.name);
+                                if ui.selectable_label(selected, label).clicked() {
+                                    select_layer = Some(layer.id);
+                                }
+                                ui.checkbox(&mut layer.locked, "ロック");
+                            });
+                        }
+                    });
+                    if let Some(id) = select_layer {
+                        self.selected_layer = Some(id);
+                        self.preview_resize_drag = false;
+                    }
+
+                    let selected_index = self
+                        .selected_layer
+                        .and_then(|id| self.layers.iter().position(|layer| layer.id == id));
+                    let can_move_front = selected_index
+                        .is_some_and(|index| index + 1 < self.layers.len());
+                    let can_move_back = selected_index.is_some_and(|index| index > 0);
+                    let mut move_front = false;
+                    let mut move_back = false;
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(can_move_front, egui::Button::new("↑ 手前へ"))
+                            .clicked()
+                        {
+                            move_front = true;
+                        }
+                        if ui
+                            .add_enabled(can_move_back, egui::Button::new("↓ 奥へ"))
+                            .clicked()
+                        {
+                            move_back = true;
+                        }
+                    });
+                    if let Some(id) = self.selected_layer {
+                        if move_front {
+                            self.move_layer_toward_front(id);
+                        } else if move_back {
+                            self.move_layer_toward_back(id);
+                        }
+                    }
+
+                    ui.add_space(6.0);
                     ui.heading("ソース / オーバーレイ");
                     ui.horizontal_wrapped(|ui| {
                         if ui.button("＋ 画像").clicked() {
                             if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("画像", &["png", "jpg", "jpeg", "webp", "bmp"])
+                                .add_filter("画像 / SVG", &["png", "jpg", "jpeg", "webp", "bmp", "svg"])
                                 .pick_file()
                             {
-                                match ImageOverlaySource::load(&path) {
-                                    Ok(mut source) => {
-                                        source.clamp_to_frame(self.preview_size[0], self.preview_size[1]);
-                                        self.image_overlay_message = format!(
-                                            "画像: {} ({}×{})",
-                                            source.name, source.pixel_width, source.pixel_height
-                                        );
-                                        self.image_overlay = Some(source);
-                                        self.image_overlay_selected = true;
-                                        self.overlay_selected = false;
-                                    }
-                                    Err(err) => {
-                                        self.image_overlay_message = format!("画像追加失敗: {err}");
-                                    }
-                                }
+                                self.add_image_from_path(&path);
                             }
                         }
                         ui.small(&self.image_overlay_message);
                     });
 
-                    let mut remove_image_overlay = false;
-                    if self.image_overlay.is_some() {
-                        egui::CollapsingHeader::new("画像ソース")
-                            .id_salt("image_overlay_controls")
-                            .default_open(true)
-                            .show(ui, |ui| {
-                                if let Some(image_overlay) = self.image_overlay.as_mut() {
+                    egui::CollapsingHeader::new("画像ライブラリ")
+                        .id_salt("image_library")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("更新").clicked() {
+                                    self.refresh_image_library();
+                                }
+                                #[cfg(target_os = "windows")]
+                                if ui.button("フォルダを開く").clicked() {
+                                    let _ = std::process::Command::new("explorer")
+                                        .arg(&self.image_library_dir)
+                                        .spawn();
+                                }
+                            });
+                            ui.small(&self.image_library_message);
+                            ui.small("image/ に入れた画像・SVGを自動認識します。background / overlay / wipe / thumbnail の各フォルダも使用できます。");
+
+                            let mut add_from_library: Option<PathBuf> = None;
+                            egui::ScrollArea::vertical()
+                                .id_salt("image_library_files")
+                                .max_height(150.0)
+                                .show(ui, |ui| {
+                                    if self.image_library_files.is_empty() {
+                                        ui.small("まだ素材がありません。image/ に画像またはSVGを入れて「更新」を押してください。");
+                                    } else {
+                                        for path in &self.image_library_files {
+                                            let relative = path
+                                                .strip_prefix(&self.image_library_dir)
+                                                .unwrap_or(path.as_path());
+                                            ui.horizontal(|ui| {
+                                                if ui.small_button("追加").clicked() {
+                                                    add_from_library = Some(path.clone());
+                                                }
+                                                ui.label(relative.display().to_string());
+                                            });
+                                        }
+                                    }
+                                });
+                            if let Some(path) = add_from_library {
+                                self.add_image_from_path(&path);
+                            }
+                        });
+
+                    ui.add_space(6.0);
+                    egui::CollapsingHeader::new("BGMライブラリ")
+                        .id_salt("bgm_library")
+                        .default_open(true)
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("更新").clicked() {
+                                    self.refresh_bgm_library();
+                                }
+                                if ui.button("＋ BGM").clicked() {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .add_filter("BGM", &["mp3", "wav", "ogg", "flac"])
+                                        .pick_file()
+                                    {
+                                        self.add_bgm_from_path(&path);
+                                    }
+                                }
+                                #[cfg(target_os = "windows")]
+                                if ui.button("フォルダを開く").clicked() {
+                                    let _ = std::process::Command::new("explorer")
+                                        .arg(&self.bgm_library_dir)
+                                        .spawn();
+                                }
+                            });
+                            ui.small(&self.bgm_library_message);
+                            ui.small("bgm/ に MP3 / WAV / OGG / FLAC を入れて「更新」。追加すると音声レイヤーになります。");
+
+                            let mut add_bgm_from_library: Option<PathBuf> = None;
+                            egui::ScrollArea::vertical()
+                                .id_salt("bgm_library_files")
+                                .max_height(130.0)
+                                .show(ui, |ui| {
+                                    if self.bgm_library_files.is_empty() {
+                                        ui.small("まだBGMがありません。bgm/ に音源を入れて「更新」を押してください。");
+                                    } else {
+                                        for path in &self.bgm_library_files {
+                                            let relative = path
+                                                .strip_prefix(&self.bgm_library_dir)
+                                                .unwrap_or(path.as_path());
+                                            ui.horizontal(|ui| {
+                                                if ui.small_button("追加").clicked() {
+                                                    add_bgm_from_library = Some(path.clone());
+                                                }
+                                                ui.label(relative.display().to_string());
+                                            });
+                                        }
+                                    }
+                                });
+                            if let Some(path) = add_bgm_from_library {
+                                self.add_bgm_from_path(&path);
+                            }
+                        });
+
+                    let selected_bgm_id = self.selected_layer.and_then(|selected_id| {
+                        self.layers
+                            .iter()
+                            .find(|layer| layer.id == selected_id && layer.kind == LayerKind::Audio)
+                            .map(|layer| layer.id)
+                    });
+                    let mut bgm_play = false;
+                    let mut bgm_pause_resume = false;
+                    let mut bgm_stop = false;
+                    let mut bgm_remove = false;
+                    let mut bgm_restart_for_loop = false;
+                    let mut bgm_volume_change: Option<f32> = None;
+                    let mut bgm_mute_change: Option<bool> = None;
+                    if let Some(bgm_layer_id) = selected_bgm_id {
+                        if let Some(bgm_index) = self
+                            .bgm_layers
+                            .iter()
+                            .position(|(id, _)| *id == bgm_layer_id)
+                        {
+                            let is_active = self.bgm_players.contains_key(&bgm_layer_id);
+                            let is_paused = self
+                                .bgm_players
+                                .get(&bgm_layer_id)
+                                .map(|player| player.is_paused())
+                                .unwrap_or(false);
+                            egui::CollapsingHeader::new("選択BGM")
+                                .id_salt(("bgm_controls", bgm_layer_id))
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    let source = &mut self.bgm_layers[bgm_index].1;
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui.checkbox(&mut source.enabled, "有効").changed() && !source.enabled {
+                                            bgm_stop = true;
+                                        }
+                                        ui.label(&source.name);
+                                        if ui.button("削除").clicked() {
+                                            bgm_remove = true;
+                                        }
+                                    });
+                                    ui.small(source.path.display().to_string());
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui.button("▶ 再生").clicked() {
+                                            bgm_play = true;
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                is_active,
+                                                egui::Button::new(if is_paused { "▶ 再開" } else { "⏸ 一時停止" }),
+                                            )
+                                            .clicked()
+                                        {
+                                            bgm_pause_resume = true;
+                                        }
+                                        if ui.add_enabled(is_active, egui::Button::new("■ 停止")).clicked() {
+                                            bgm_stop = true;
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.label("音量");
+                                        if ui
+                                            .add(egui::Slider::new(&mut source.volume_percent, 0.0..=100.0).suffix("%"))
+                                            .changed()
+                                        {
+                                            bgm_volume_change = Some(source.effective_volume());
+                                        }
+                                        if ui.checkbox(&mut source.muted, "Mute").changed() {
+                                            bgm_mute_change = Some(source.muted);
+                                            bgm_volume_change = Some(source.effective_volume());
+                                        }
+                                    });
+                                    if ui.checkbox(&mut source.loop_enabled, "ループ再生").changed() && is_active {
+                                        bgm_restart_for_loop = true;
+                                    }
+                                });
+                        }
+                    }
+                    if let Some(bgm_layer_id) = selected_bgm_id {
+                        if let Some(volume) = bgm_volume_change {
+                            if let Some(player) = self.bgm_players.get(&bgm_layer_id) {
+                                player.set_volume(volume);
+                            }
+                        }
+                        if let Some(muted) = bgm_mute_change {
+                            self.bgm_message = if muted {
+                                "BGM: Mute ON".to_owned()
+                            } else {
+                                "BGM: Mute OFF".to_owned()
+                            };
+                        }
+                        if bgm_remove {
+                            self.remove_bgm_layer(bgm_layer_id);
+                            self.bgm_message = if self.bgm_layers.is_empty() {
+                                "BGM: 未追加".to_owned()
+                            } else {
+                                format!("BGM削除 / 残り {} 曲", self.bgm_layers.len())
+                            };
+                        } else {
+                            if bgm_stop {
+                                if let Some(player) = self.bgm_players.remove(&bgm_layer_id) {
+                                    player.stop();
+                                }
+                                self.bgm_message = "BGM: 停止".to_owned();
+                            }
+                            if bgm_pause_resume {
+                                if let Some(player) = self.bgm_players.get(&bgm_layer_id) {
+                                    if player.is_paused() {
+                                        player.resume();
+                                        self.bgm_message = "BGM: 再開".to_owned();
+                                    } else {
+                                        player.pause();
+                                        self.bgm_message = "BGM: 一時停止".to_owned();
+                                    }
+                                }
+                            }
+                            if bgm_play || bgm_restart_for_loop {
+                                self.play_bgm_layer(bgm_layer_id);
+                            }
+                        }
+                    }
+                    ui.small(&self.bgm_message);
+
+                    let selected_image_id = self.selected_layer.and_then(|selected_id| {
+                        self.layers
+                            .iter()
+                            .find(|layer| layer.id == selected_id && layer.kind == LayerKind::Image)
+                            .map(|layer| layer.id)
+                    });
+                    let mut remove_selected_image = false;
+                    if let Some(image_layer_id) = selected_image_id {
+                        if let Some(image_index) = self
+                            .image_overlays
+                            .iter()
+                            .position(|(id, _)| *id == image_layer_id)
+                        {
+                            egui::CollapsingHeader::new("選択画像")
+                                .id_salt(("image_overlay_controls", image_layer_id))
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    let image_overlay = &mut self.image_overlays[image_index].1;
                                     ui.horizontal(|ui| {
                                         ui.checkbox(&mut image_overlay.enabled, "表示");
                                         ui.label(&image_overlay.name);
                                         if ui.button("削除").clicked() {
-                                            remove_image_overlay = true;
+                                            remove_selected_image = true;
                                         }
                                     });
-                                    ui.small(format!("元サイズ {}×{}", image_overlay.pixel_width, image_overlay.pixel_height));
+                                    ui.small(format!(
+                                        "元サイズ {}×{}",
+                                        image_overlay.pixel_width, image_overlay.pixel_height
+                                    ));
                                     ui.horizontal(|ui| {
                                         ui.label("X");
                                         let changed = ui
@@ -1637,14 +2435,25 @@ impl eframe::App for YaoyorozuApp {
                                             image_overlay.clamp_to_frame(self.preview_size[0], self.preview_size[1]);
                                         }
                                     });
-                                }
-                            });
+                                });
+                        }
+                    } else if !self.image_overlays.is_empty() {
+                        ui.small(format!(
+                            "画像レイヤー: {} 枚（レイヤー一覧から選択すると編集できます）",
+                            self.image_overlays.len()
+                        ));
                     }
-                    if remove_image_overlay {
-                        self.image_overlay = None;
-                        self.image_overlay_selected = false;
-                        self.image_overlay_resize_drag = false;
-                        self.image_overlay_message = "画像オーバーレイ: 未追加".to_owned();
+
+                    if let Some(image_layer_id) = selected_image_id {
+                        if remove_selected_image {
+                            self.remove_image_layer(image_layer_id);
+                            self.preview_resize_drag = false;
+                            self.image_overlay_message = if self.image_overlays.is_empty() {
+                                "画像オーバーレイ: 未追加".to_owned()
+                            } else {
+                                format!("画像削除 / 残り {} 枚", self.image_overlays.len())
+                            };
+                        }
                     }
 
                     egui::CollapsingHeader::new("ししゃも（テスト）")
@@ -1682,6 +2491,25 @@ impl eframe::App for YaoyorozuApp {
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                     ui.heading("音声ミキサー");
+
+                    // Phase 8A: BGMはまだWindows既定出力経由だが、
+                    // ミキサーからGain/Muteを直接操作できるようにする。
+                    // Mix/WAVの直接ルーティングはPhase 8Bでstream-audioへ統合する。
+                    let bgm_mixer_snapshot: Vec<_> = self
+                        .bgm_layers
+                        .iter()
+                        .map(|(id, source)| {
+                            (
+                                *id,
+                                source.name.clone(),
+                                source.volume_percent,
+                                source.muted,
+                            )
+                        })
+                        .collect();
+                    let mut bgm_mixer_gain_changes: Vec<(LayerId, f32)> = Vec::new();
+                    let mut bgm_mixer_mute_changes: Vec<(LayerId, bool)> = Vec::new();
+                    let mut bgm_mixer_remove: Option<LayerId> = None;
 
                     if let Some(audio) = &self.audio {
                         let settings = audio.mixer_settings();
@@ -1724,7 +2552,7 @@ impl eframe::App for YaoyorozuApp {
                             ),
                         };
 
-                        ui.small("同一サイズのチャンネルストリップ / PC・マイク・アプリ音声・Masterを同じ基準で表示します");
+                        ui.small("同一サイズのチャンネルストリップ / PC・マイク・BGM・アプリ音声・Masterを同じ基準で表示します");
                         ui.add_space(4.0);
 
                         let mut remove_channel = None;
@@ -1800,6 +2628,35 @@ impl eframe::App for YaoyorozuApp {
                                             if let Some(record) = microphone_strip.wav {
                                                 audio.set_channel_record_individual(channel.id, record);
                                             }
+                                        }
+                                    }
+
+                                    for (bgm_id, bgm_name, volume_percent, muted) in &bgm_mixer_snapshot {
+                                        let bgm_strip = draw_mixer_channel_strip(
+                                            ui,
+                                            MixerStripModel {
+                                                title: "BGM".to_owned(),
+                                                source: bgm_name.clone(),
+                                                // Phase 8AではPCMメーターはまだstream-audio未統合。
+                                                // ストリップ構造を先に統一し、実レベルは8Bで接続する。
+                                                level: 0.0,
+                                                gain_percent: *volume_percent,
+                                                mute: Some(*muted),
+                                                mix: None,
+                                                wav: None,
+                                                removable: true,
+                                            },
+                                        );
+                                        if bgm_strip.gain_changed {
+                                            bgm_mixer_gain_changes.push((*bgm_id, bgm_strip.gain_percent));
+                                        }
+                                        if bgm_strip.mute != Some(*muted) {
+                                            if let Some(new_muted) = bgm_strip.mute {
+                                                bgm_mixer_mute_changes.push((*bgm_id, new_muted));
+                                            }
+                                        }
+                                        if bgm_strip.remove_clicked {
+                                            bgm_mixer_remove = Some(*bgm_id);
                                         }
                                     }
 
@@ -2014,6 +2871,33 @@ impl eframe::App for YaoyorozuApp {
                         ui.label("音声デバイスを取得できていません");
                     }
 
+                    // BGM操作はaudioへの借用を解放してから反映する。
+                    for (id, gain_percent) in bgm_mixer_gain_changes {
+                        if let Some((_, source)) = self.bgm_layers.iter_mut().find(|(layer_id, _)| *layer_id == id) {
+                            source.volume_percent = gain_percent.clamp(0.0, 100.0);
+                            if let Some(player) = self.bgm_players.get(&id) {
+                                player.set_volume(source.effective_volume());
+                            }
+                        }
+                    }
+                    for (id, muted) in bgm_mixer_mute_changes {
+                        if let Some((_, source)) = self.bgm_layers.iter_mut().find(|(layer_id, _)| *layer_id == id) {
+                            source.muted = muted;
+                            if let Some(player) = self.bgm_players.get(&id) {
+                                player.set_volume(source.effective_volume());
+                            }
+                        }
+                    }
+                    if let Some(id) = bgm_mixer_remove {
+                        self.remove_bgm_layer(id);
+                        self.bgm_message = if self.bgm_layers.is_empty() {
+                            "BGM: 未追加".to_owned()
+                        } else {
+                            format!("BGM削除 / 残り {} 曲", self.bgm_layers.len())
+                        };
+                    }
+
+                    ui.small("BGMのMix/WAVと実レベルメーターはPhase 8Bで直接PCM統合します");
                     ui.small(&self.audio_message);
                             });
                     },

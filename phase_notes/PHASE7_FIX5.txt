@@ -19,7 +19,7 @@ Fix:
 Run:
 cargo test --workspace
 cargo check --workspace
-cargo run -p yaoyorozu-stream
+cargo run -p tsubame
 
 Manual game test:
 1. Choose Game 1080p60.

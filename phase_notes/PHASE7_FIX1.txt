@@ -14,7 +14,7 @@ Fix:
 Run:
 cargo test --workspace
 cargo check --workspace
-cargo run -p yaoyorozu-stream
+cargo run -p tsubame
 
 Then:
 - start a 10-20 second recording

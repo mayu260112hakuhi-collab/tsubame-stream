@@ -16,7 +16,7 @@ WGC Direct3D11 Frame -> Windows Media Foundation H.264
 Validation:
 cargo test --workspace
 cargo check --workspace
-cargo run -p yaoyorozu-stream
+cargo run -p tsubame
 
 Compare the same game scene at:
 1. Preview 30 FPS

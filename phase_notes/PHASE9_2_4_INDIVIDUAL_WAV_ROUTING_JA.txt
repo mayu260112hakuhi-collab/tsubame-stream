@@ -38,7 +38,7 @@ UI
 ユーザー側確認
     cargo test --workspace
     cargo check --workspace
-    cargo run -p yaoyorozu-stream
+    cargo run -p tsubame
 
 実機確認
 - Discordをアプリ音声へ追加

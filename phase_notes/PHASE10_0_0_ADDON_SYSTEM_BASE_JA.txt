@@ -11,7 +11,7 @@ Phase 10.0.0: 燕 Addon System 基盤
 - 公式アドオンの有効/無効スイッチUIを追加。
 - Blender方式を想定した外部アドオン追加入口を追加。
 - 外部アドオンはPhase 10.0.0では登録のみで、コード実行はしない。
-- package/repository名 yaoyorozu-stream は互換性維持のため現時点では変更しない。
+- package/repository名 tsubame は互換性維持のため現時点では変更しない。
 - 表示名は「燕 / Tsubame」へ移行開始。
 
 安定性方針

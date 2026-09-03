@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2021, Cargo workspace, serde/serde_json, crossbeam-channel, eframe/egui（Windows UI実装時）, Windows capture/audio APIs, YouTube Data/Live Streaming APIs, H.264 hardware encoders, Windows Named Pipe, AviUtl2 Bridge Plugin.
 
-**Spec:** `docs/superpowers/specs/2026-08-26-yaoyorozu-stream-v0.1-design.md`
+**Spec:** `docs/superpowers/specs/2026-08-26-tsubame-v0.1-design.md`
 
 ## Global Constraints
 
@@ -75,18 +75,18 @@
 ### Task 4: D-layout application shell
 
 **Files:**
-- Create: `apps/yaoyorozu-stream/Cargo.toml`
-- Create: `apps/yaoyorozu-stream/src/main.rs`
-- Create: `apps/yaoyorozu-stream/src/app.rs`
-- Create: `apps/yaoyorozu-stream/src/view_model.rs`
-- Create: `apps/yaoyorozu-stream/tests/view_model.rs`
+- Create: `apps/tsubame/Cargo.toml`
+- Create: `apps/tsubame/src/main.rs`
+- Create: `apps/tsubame/src/app.rs`
+- Create: `apps/tsubame/src/view_model.rs`
+- Create: `apps/tsubame/tests/view_model.rs`
 
 **Interfaces:**
 - Consumes: core session, marker and worker status types.
 - Produces: `StreamViewModel` with preview state, YouTube panel state, audio meters, marker actions and post-stream AviUtl2 action.
 
 - [ ] **Step 1: Write failing view-model tests** for default Game preset, four marker actions, and AviUtl2 action visibility only after stop.
-- [ ] **Step 2: Run** `cargo test -p yaoyorozu-stream --test view_model` and verify RED.
+- [ ] **Step 2: Run** `cargo test -p tsubame --test view_model` and verify RED.
 - [ ] **Step 3: Implement** the view model without capture/network side effects.
 - [ ] **Step 4: Implement** egui D-layout: large preview left, YouTube controls right, audio and markers below.
 - [ ] **Step 5: Run** workspace tests and `cargo check --workspace`; verify GREEN.

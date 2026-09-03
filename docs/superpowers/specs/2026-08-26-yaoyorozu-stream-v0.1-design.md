@@ -277,7 +277,7 @@ JSONにはAviUtl2固有の内部構造を持たせず、編集上の意味デー
 ## 9. 推奨Rustモジュール境界
 
 ```text
-yaoyorozu-stream/
+tsubame/
 ├─ crates/
 │  ├─ stream-core/
 │  │  ├─ session
@@ -292,7 +292,7 @@ yaoyorozu-stream/
 │  ├─ stream-aviutl-bridge/
 │  └─ stream-ui/
 └─ apps/
-   └─ yaoyorozu-stream/
+   └─ tsubame/
 ```
 
 責務を分離し、特定のキャプチャAPI・エンコーダー・YouTube API・AviUtl2 SDKへの依存を局所化する。

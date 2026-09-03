@@ -36,7 +36,7 @@ native path rather than converting every recording frame to CPU RGBA.
 Validation:
 cargo test --workspace
 cargo check --workspace
-cargo run -p yaoyorozu-stream
+cargo run -p tsubame
 
 Game test:
 1. Game preset 1080p60.

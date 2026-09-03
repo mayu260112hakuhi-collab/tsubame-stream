@@ -2,7 +2,7 @@ Yaoyorozu Stream Phase 3 validation
 
 1. cargo test --workspace
 2. cargo check --workspace
-3. cargo run -p yaoyorozu-stream
+3. cargo run -p tsubame
 
 Expected:
 - Japanese labels are readable using a Windows system Japanese font.

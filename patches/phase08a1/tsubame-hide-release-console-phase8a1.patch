@@ -1,0 +1,8 @@
+--- a/apps/tsubame/src/main.rs
++++ b/apps/tsubame/src/main.rs
+@@ -1,3 +1,5 @@
++#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
++
+ use tsubame_stream::app::YaoyorozuApp;
+ 
+ fn main() -> eframe::Result<()> {

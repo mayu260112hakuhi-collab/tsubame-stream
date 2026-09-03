@@ -1,0 +1,380 @@
+--- /mnt/data/app_phase3.rs	2026-09-03 11:06:56.130830015 +0000
++++ /mnt/data/app_phase4.rs	2026-09-03 11:19:45.811979815 +0000
+@@ -372,9 +372,8 @@
+     selected_layer: Option<LayerId>,
+     next_layer_id: LayerId,
+     fish_layer_id: LayerId,
+-    image_layer_id: Option<LayerId>,
+     preview_resize_drag: bool,
+-    image_overlay: Option<ImageOverlaySource>,
++    image_overlays: Vec<(LayerId, ImageOverlaySource)>,
+     image_overlay_message: String,
+     app_started_at: std::time::Instant,
+     streaming: Option<StreamingSession>,
+@@ -424,26 +423,19 @@
+         }
+     }
+ 
+-    fn replace_image_layer(&mut self, name: String) -> LayerId {
+-        if let Some(old_id) = self.image_layer_id.take() {
+-            self.layers.retain(|layer| layer.id != old_id);
+-            if self.selected_layer == Some(old_id) {
+-                self.selected_layer = None;
+-            }
+-        }
+-
++    fn add_image_layer(&mut self, source: ImageOverlaySource) -> LayerId {
+         let id = self.allocate_layer_id();
+-        self.layers.push(SceneLayer::new(id, LayerKind::Image, name));
+-        self.image_layer_id = Some(id);
++        self.layers
++            .push(SceneLayer::new(id, LayerKind::Image, source.name.clone()));
++        self.image_overlays.push((id, source));
+         id
+     }
+ 
+-    fn remove_image_layer_metadata(&mut self) {
+-        if let Some(id) = self.image_layer_id.take() {
+-            self.layers.retain(|layer| layer.id != id);
+-            if self.selected_layer == Some(id) {
+-                self.selected_layer = None;
+-            }
++    fn remove_image_layer(&mut self, id: LayerId) {
++        self.layers.retain(|layer| layer.id != id);
++        self.image_overlays.retain(|(layer_id, _)| *layer_id != id);
++        if self.selected_layer == Some(id) {
++            self.selected_layer = None;
+         }
+     }
+ 
+@@ -558,9 +550,8 @@
+             selected_layer: None,
+             next_layer_id: fish_layer_id + 1,
+             fish_layer_id,
+-            image_layer_id: None,
+             preview_resize_drag: false,
+-            image_overlay: None,
++            image_overlays: Vec::new(),
+             image_overlay_message: "画像オーバーレイ: 未追加".to_owned(),
+             app_started_at: std::time::Instant::now(),
+             streaming: None,
+@@ -786,10 +777,11 @@
+ 
+         let overlay_enabled = self.layers.iter().any(|layer| match layer.kind {
+             LayerKind::FishOverlay if layer.id == self.fish_layer_id => self.overlay_source.enabled,
+-            LayerKind::Image if Some(layer.id) == self.image_layer_id => self
+-                .image_overlay
+-                .as_ref()
+-                .is_some_and(|overlay| overlay.enabled),
++            LayerKind::Image => self
++                .image_overlays
++                .iter()
++                .find(|(id, _)| *id == layer.id)
++                .is_some_and(|(_, overlay)| overlay.enabled),
+             _ => false,
+         });
+ 
+@@ -811,8 +803,12 @@
+                             self.app_started_at.elapsed().as_secs_f32(),
+                         );
+                     }
+-                    LayerKind::Image if Some(layer.id) == self.image_layer_id => {
+-                        if let Some(image_overlay) = &self.image_overlay {
++                    LayerKind::Image => {
++                        if let Some((_, image_overlay)) = self
++                            .image_overlays
++                            .iter()
++                            .find(|(id, _)| *id == layer.id)
++                        {
+                             image_overlay.compose(&mut composed_rgba, frame.width, frame.height);
+                         }
+                     }
+@@ -1296,93 +1292,104 @@
+                 }
+             }
+ 
+-            let image_layer_id = self.image_layer_id;
+-            let image_locked = image_layer_id
+-                .map(|id| self.layer_locked(id))
+-                .unwrap_or(false);
+-            if let Some(image_overlay) = self.image_overlay.as_mut() {
+-                if image_overlay.enabled && self.preview_size[0] > 0 && self.preview_size[1] > 0 {
+-                    let overlay_w = image_rect.width() * image_overlay.width_percent / 100.0;
+-                    let overlay_h = overlay_w * image_overlay.aspect();
+-                    let center = egui::pos2(
+-                        image_rect.left() + image_rect.width() * image_overlay.x_percent / 100.0,
+-                        image_rect.top() + image_rect.height() * image_overlay.y_percent / 100.0,
+-                    );
+-                    let overlay_rect =
+-                        egui::Rect::from_center_size(center, egui::vec2(overlay_w, overlay_h));
+-                    let hit_rect = overlay_rect.expand(5.0).intersect(image_rect);
+-                    let image_response = ui.interact(
+-                        hit_rect,
+-                        ui.id().with("overlay_image_drag"),
+-                        egui::Sense::click_and_drag(),
+-                    );
+-                    let handle_size = 12.0;
+-                    let handle_rect = egui::Rect::from_center_size(
+-                        overlay_rect.right_bottom(),
+-                        egui::vec2(handle_size, handle_size),
+-                    );
++            let image_layer_ids: Vec<LayerId> = self
++                .layers
++                .iter()
++                .rev()
++                .filter(|layer| layer.kind == LayerKind::Image)
++                .map(|layer| layer.id)
++                .collect();
++
++            for image_layer_id in image_layer_ids {
++                let image_locked = self.layer_locked(image_layer_id);
++                let Some(image_index) = self
++                    .image_overlays
++                    .iter()
++                    .position(|(id, _)| *id == image_layer_id)
++                else {
++                    continue;
++                };
++                let image_overlay = &mut self.image_overlays[image_index].1;
++                if !image_overlay.enabled || self.preview_size[0] == 0 || self.preview_size[1] == 0 {
++                    continue;
++                }
+ 
+-                    if image_response.clicked() {
+-                        if let Some(id) = image_layer_id {
+-                            self.selected_layer = Some(id);
+-                        }
+-                        overlay_interacted = true;
+-                    }
+-                    if image_response.drag_started() {
+-                        if let Some(id) = image_layer_id {
+-                            self.selected_layer = Some(id);
+-                        }
+-                        overlay_interacted = true;
+-                        self.preview_resize_drag = !image_locked
+-                            && ui
+-                                .ctx()
+-                                .pointer_interact_pos()
+-                                .map(|p| handle_rect.expand(5.0).contains(p))
+-                                .unwrap_or(false);
+-                    }
+-                    if image_response.dragged() {
+-                        overlay_interacted = true;
+-                        let delta = ui.ctx().input(|i| i.pointer.delta());
+-                        if image_locked {
+-                            // Locked layers can still be selected, but transforms are ignored.
+-                        } else if self.preview_resize_drag {
+-                            image_overlay.resize_by_preview_delta(
+-                                delta.x,
+-                                image_rect.width(),
+-                                self.preview_size[0],
+-                                self.preview_size[1],
+-                            );
+-                        } else {
+-                            image_overlay.move_by_preview_delta(
+-                                delta.x,
+-                                delta.y,
+-                                image_rect.width(),
+-                                image_rect.height(),
+-                                self.preview_size[0],
+-                                self.preview_size[1],
+-                            );
+-                        }
+-                    }
+-                    if image_response.drag_stopped() {
+-                        self.preview_resize_drag = false;
+-                    }
++                let overlay_w = image_rect.width() * image_overlay.width_percent / 100.0;
++                let overlay_h = overlay_w * image_overlay.aspect();
++                let center = egui::pos2(
++                    image_rect.left() + image_rect.width() * image_overlay.x_percent / 100.0,
++                    image_rect.top() + image_rect.height() * image_overlay.y_percent / 100.0,
++                );
++                let overlay_rect =
++                    egui::Rect::from_center_size(center, egui::vec2(overlay_w, overlay_h));
++                let hit_rect = overlay_rect.expand(5.0).intersect(image_rect);
++                let image_response = ui.interact(
++                    hit_rect,
++                    ui.id().with(("overlay_image_drag", image_layer_id)),
++                    egui::Sense::click_and_drag(),
++                );
++                let handle_size = 12.0;
++                let handle_rect = egui::Rect::from_center_size(
++                    overlay_rect.right_bottom(),
++                    egui::vec2(handle_size, handle_size),
++                );
+ 
+-                    if image_layer_id.is_some() && self.selected_layer == image_layer_id {
+-                        let stroke =
+-                            egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(130, 220, 140));
+-                        ui.painter().rect_stroke(
+-                            overlay_rect,
+-                            2.0,
+-                            stroke,
+-                            egui::StrokeKind::Outside,
++                if image_response.clicked() {
++                    self.selected_layer = Some(image_layer_id);
++                    overlay_interacted = true;
++                }
++                if image_response.drag_started() {
++                    self.selected_layer = Some(image_layer_id);
++                    overlay_interacted = true;
++                    self.preview_resize_drag = !image_locked
++                        && ui
++                            .ctx()
++                            .pointer_interact_pos()
++                            .map(|p| handle_rect.expand(5.0).contains(p))
++                            .unwrap_or(false);
++                }
++                if image_response.dragged() {
++                    overlay_interacted = true;
++                    let delta = ui.ctx().input(|i| i.pointer.delta());
++                    if image_locked {
++                        // Locked layers can still be selected, but transforms are ignored.
++                    } else if self.preview_resize_drag {
++                        image_overlay.resize_by_preview_delta(
++                            delta.x,
++                            image_rect.width(),
++                            self.preview_size[0],
++                            self.preview_size[1],
+                         );
+-                        ui.painter().rect_filled(
+-                            handle_rect,
+-                            1.0,
+-                            egui::Color32::from_rgb(130, 220, 140),
++                    } else {
++                        image_overlay.move_by_preview_delta(
++                            delta.x,
++                            delta.y,
++                            image_rect.width(),
++                            image_rect.height(),
++                            self.preview_size[0],
++                            self.preview_size[1],
+                         );
+                     }
+                 }
++                if image_response.drag_stopped() {
++                    self.preview_resize_drag = false;
++                }
++
++                if self.selected_layer == Some(image_layer_id) {
++                    let stroke =
++                        egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(130, 220, 140));
++                    ui.painter().rect_stroke(
++                        overlay_rect,
++                        2.0,
++                        stroke,
++                        egui::StrokeKind::Outside,
++                    );
++                    ui.painter().rect_filled(
++                        handle_rect,
++                        1.0,
++                        egui::Color32::from_rgb(130, 220, 140),
++                    );
++                }
+             }
+ 
+             if outer_response.clicked() && !overlay_interacted {
+@@ -1921,13 +1928,18 @@
+                                 match ImageOverlaySource::load(&path) {
+                                     Ok(mut source) => {
+                                         source.clamp_to_frame(self.preview_size[0], self.preview_size[1]);
++                                        let source_name = source.name.clone();
++                                        let pixel_width = source.pixel_width;
++                                        let pixel_height = source.pixel_height;
++                                        let layer_id = self.add_image_layer(source);
++                                        self.selected_layer = Some(layer_id);
+                                         self.image_overlay_message = format!(
+-                                            "画像: {} ({}×{})",
+-                                            source.name, source.pixel_width, source.pixel_height
++                                            "画像追加: {} ({}×{}) / 合計 {} 枚",
++                                            source_name,
++                                            pixel_width,
++                                            pixel_height,
++                                            self.image_overlays.len()
+                                         );
+-                                        let layer_id = self.replace_image_layer(source.name.clone());
+-                                        self.image_overlay = Some(source);
+-                                        self.selected_layer = Some(layer_id);
+                                     }
+                                     Err(err) => {
+                                         self.image_overlay_message = format!("画像追加失敗: {err}");
+@@ -1938,21 +1950,35 @@
+                         ui.small(&self.image_overlay_message);
+                     });
+ 
+-                    let mut remove_image_overlay = false;
+-                    if self.image_overlay.is_some() {
+-                        egui::CollapsingHeader::new("画像ソース")
+-                            .id_salt("image_overlay_controls")
+-                            .default_open(true)
+-                            .show(ui, |ui| {
+-                                if let Some(image_overlay) = self.image_overlay.as_mut() {
++                    let selected_image_id = self.selected_layer.and_then(|selected_id| {
++                        self.layers
++                            .iter()
++                            .find(|layer| layer.id == selected_id && layer.kind == LayerKind::Image)
++                            .map(|layer| layer.id)
++                    });
++                    let mut remove_selected_image = false;
++                    if let Some(image_layer_id) = selected_image_id {
++                        if let Some(image_index) = self
++                            .image_overlays
++                            .iter()
++                            .position(|(id, _)| *id == image_layer_id)
++                        {
++                            egui::CollapsingHeader::new("選択画像")
++                                .id_salt(("image_overlay_controls", image_layer_id))
++                                .default_open(true)
++                                .show(ui, |ui| {
++                                    let image_overlay = &mut self.image_overlays[image_index].1;
+                                     ui.horizontal(|ui| {
+                                         ui.checkbox(&mut image_overlay.enabled, "表示");
+                                         ui.label(&image_overlay.name);
+                                         if ui.button("削除").clicked() {
+-                                            remove_image_overlay = true;
++                                            remove_selected_image = true;
+                                         }
+                                     });
+-                                    ui.small(format!("元サイズ {}×{}", image_overlay.pixel_width, image_overlay.pixel_height));
++                                    ui.small(format!(
++                                        "元サイズ {}×{}",
++                                        image_overlay.pixel_width, image_overlay.pixel_height
++                                    ));
+                                     ui.horizontal(|ui| {
+                                         ui.label("X");
+                                         let changed = ui
+@@ -1980,14 +2006,25 @@
+                                             image_overlay.clamp_to_frame(self.preview_size[0], self.preview_size[1]);
+                                         }
+                                     });
+-                                }
+-                            });
+-                    }
+-                    if remove_image_overlay {
+-                        self.image_overlay = None;
+-                        self.remove_image_layer_metadata();
+-                        self.preview_resize_drag = false;
+-                        self.image_overlay_message = "画像オーバーレイ: 未追加".to_owned();
++                                });
++                        }
++                    } else if !self.image_overlays.is_empty() {
++                        ui.small(format!(
++                            "画像レイヤー: {} 枚（レイヤー一覧から選択すると編集できます）",
++                            self.image_overlays.len()
++                        ));
++                    }
++
++                    if let Some(image_layer_id) = selected_image_id {
++                        if remove_selected_image {
++                            self.remove_image_layer(image_layer_id);
++                            self.preview_resize_drag = false;
++                            self.image_overlay_message = if self.image_overlays.is_empty() {
++                                "画像オーバーレイ: 未追加".to_owned()
++                            } else {
++                                format!("画像削除 / 残り {} 枚", self.image_overlays.len())
++                            };
++                        }
+                     }
+ 
+                     egui::CollapsingHeader::new("ししゃも（テスト）")

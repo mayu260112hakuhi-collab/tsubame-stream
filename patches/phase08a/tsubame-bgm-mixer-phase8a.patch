@@ -1,0 +1,183 @@
+--- a/apps/tsubame/src/app.rs
++++ b/apps/tsubame/src/app.rs
+@@ -596,7 +596,7 @@
+         }
+         let path = source.path.clone();
+         let loop_enabled = source.loop_enabled;
+-        let volume = source.volume_linear();
++        let volume = source.effective_volume();
+         let name = source.name.clone();
+         match BgmPlayer::play_file(&path, loop_enabled, volume) {
+             Ok(player) => {
+@@ -2270,6 +2270,7 @@
+                     let mut bgm_remove = false;
+                     let mut bgm_restart_for_loop = false;
+                     let mut bgm_volume_change: Option<f32> = None;
++                    let mut bgm_mute_change: Option<bool> = None;
+                     if let Some(bgm_layer_id) = selected_bgm_id {
+                         if let Some(bgm_index) = self
+                             .bgm_layers
+@@ -2320,7 +2321,11 @@
+                                             .add(egui::Slider::new(&mut source.volume_percent, 0.0..=100.0).suffix("%"))
+                                             .changed()
+                                         {
+-                                            bgm_volume_change = Some(source.volume_linear());
++                                            bgm_volume_change = Some(source.effective_volume());
++                                        }
++                                        if ui.checkbox(&mut source.muted, "Mute").changed() {
++                                            bgm_mute_change = Some(source.muted);
++                                            bgm_volume_change = Some(source.effective_volume());
+                                         }
+                                     });
+                                     if ui.checkbox(&mut source.loop_enabled, "ループ再生").changed() && is_active {
+@@ -2334,6 +2339,13 @@
+                             if let Some(player) = self.bgm_players.get(&bgm_layer_id) {
+                                 player.set_volume(volume);
+                             }
++                        }
++                        if let Some(muted) = bgm_mute_change {
++                            self.bgm_message = if muted {
++                                "BGM: Mute ON".to_owned()
++                            } else {
++                                "BGM: Mute OFF".to_owned()
++                            };
+                         }
+                         if bgm_remove {
+                             self.remove_bgm_layer(bgm_layer_id);
+@@ -2480,6 +2492,25 @@
+                             .show(ui, |ui| {
+                     ui.heading("音声ミキサー");
+ 
++                    // Phase 8A: BGMはまだWindows既定出力経由だが、
++                    // ミキサーからGain/Muteを直接操作できるようにする。
++                    // Mix/WAVの直接ルーティングはPhase 8Bでstream-audioへ統合する。
++                    let bgm_mixer_snapshot: Vec<_> = self
++                        .bgm_layers
++                        .iter()
++                        .map(|(id, source)| {
++                            (
++                                *id,
++                                source.name.clone(),
++                                source.volume_percent,
++                                source.muted,
++                            )
++                        })
++                        .collect();
++                    let mut bgm_mixer_gain_changes: Vec<(LayerId, f32)> = Vec::new();
++                    let mut bgm_mixer_mute_changes: Vec<(LayerId, bool)> = Vec::new();
++                    let mut bgm_mixer_remove: Option<LayerId> = None;
++
+                     if let Some(audio) = &self.audio {
+                         let settings = audio.mixer_settings();
+                         let output_devices = audio.output_devices();
+@@ -2521,7 +2552,7 @@
+                             ),
+                         };
+ 
+-                        ui.small("同一サイズのチャンネルストリップ / PC・マイク・アプリ音声・Masterを同じ基準で表示します");
++                        ui.small("同一サイズのチャンネルストリップ / PC・マイク・BGM・アプリ音声・Masterを同じ基準で表示します");
+                         ui.add_space(4.0);
+ 
+                         let mut remove_channel = None;
+@@ -2597,6 +2628,35 @@
+                                             if let Some(record) = microphone_strip.wav {
+                                                 audio.set_channel_record_individual(channel.id, record);
+                                             }
++                                        }
++                                    }
++
++                                    for (bgm_id, bgm_name, volume_percent, muted) in &bgm_mixer_snapshot {
++                                        let bgm_strip = draw_mixer_channel_strip(
++                                            ui,
++                                            MixerStripModel {
++                                                title: "BGM".to_owned(),
++                                                source: bgm_name.clone(),
++                                                // Phase 8AではPCMメーターはまだstream-audio未統合。
++                                                // ストリップ構造を先に統一し、実レベルは8Bで接続する。
++                                                level: 0.0,
++                                                gain_percent: *volume_percent,
++                                                mute: Some(*muted),
++                                                mix: None,
++                                                wav: None,
++                                                removable: true,
++                                            },
++                                        );
++                                        if bgm_strip.gain_changed {
++                                            bgm_mixer_gain_changes.push((*bgm_id, bgm_strip.gain_percent));
++                                        }
++                                        if bgm_strip.mute != Some(*muted) {
++                                            if let Some(new_muted) = bgm_strip.mute {
++                                                bgm_mixer_mute_changes.push((*bgm_id, new_muted));
++                                            }
++                                        }
++                                        if bgm_strip.remove_clicked {
++                                            bgm_mixer_remove = Some(*bgm_id);
+                                         }
+                                     }
+ 
+@@ -2811,6 +2871,33 @@
+                         ui.label("音声デバイスを取得できていません");
+                     }
+ 
++                    // BGM操作はaudioへの借用を解放してから反映する。
++                    for (id, gain_percent) in bgm_mixer_gain_changes {
++                        if let Some((_, source)) = self.bgm_layers.iter_mut().find(|(layer_id, _)| *layer_id == id) {
++                            source.volume_percent = gain_percent.clamp(0.0, 100.0);
++                            if let Some(player) = self.bgm_players.get(&id) {
++                                player.set_volume(source.effective_volume());
++                            }
++                        }
++                    }
++                    for (id, muted) in bgm_mixer_mute_changes {
++                        if let Some((_, source)) = self.bgm_layers.iter_mut().find(|(layer_id, _)| *layer_id == id) {
++                            source.muted = muted;
++                            if let Some(player) = self.bgm_players.get(&id) {
++                                player.set_volume(source.effective_volume());
++                            }
++                        }
++                    }
++                    if let Some(id) = bgm_mixer_remove {
++                        self.remove_bgm_layer(id);
++                        self.bgm_message = if self.bgm_layers.is_empty() {
++                            "BGM: 未追加".to_owned()
++                        } else {
++                            format!("BGM削除 / 残り {} 曲", self.bgm_layers.len())
++                        };
++                    }
++
++                    ui.small("BGMのMix/WAVと実レベルメーターはPhase 8Bで直接PCM統合します");
+                     ui.small(&self.audio_message);
+                             });
+                     },
+--- a/apps/tsubame/src/bgm.rs
++++ b/apps/tsubame/src/bgm.rs
+@@ -11,6 +11,7 @@
+     pub name: String,
+     pub path: PathBuf,
+     pub volume_percent: f32,
++    pub muted: bool,
+     pub loop_enabled: bool,
+ }
+ 
+@@ -25,12 +26,21 @@
+                 .to_owned(),
+             path: path.to_path_buf(),
+             volume_percent: 70.0,
++            muted: false,
+             loop_enabled: true,
+         }
+     }
+ 
+     pub fn volume_linear(&self) -> f32 {
+         (self.volume_percent / 100.0).clamp(0.0, 1.0)
++    }
++
++    pub fn effective_volume(&self) -> f32 {
++        if self.muted {
++            0.0
++        } else {
++            self.volume_linear()
++        }
+     }
+ }
+ 

@@ -1,0 +1,168 @@
+--- /mnt/data/app.rs.bin	2026-09-03 10:32:55.758823171 +0000
++++ /mnt/data/app.rs	2026-09-03 10:34:36.973169519 +0000
+@@ -147,6 +147,12 @@
+     ExternalAddons,
+ }
+ 
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum PreviewLayerSelection {
++    Fish,
++    Image,
++}
++
+ #[derive(Debug, Clone)]
+ struct MixerStripModel {
+     title: String,
+@@ -368,11 +374,9 @@
+     streaming_target: StreamingTargetConfig,
+     show_stream_key: bool,
+     overlay_source: OverlaySource,
+-    overlay_selected: bool,
+-    overlay_resize_drag: bool,
++    selected_preview_layer: Option<PreviewLayerSelection>,
++    preview_resize_drag: bool,
+     image_overlay: Option<ImageOverlaySource>,
+-    image_overlay_selected: bool,
+-    image_overlay_resize_drag: bool,
+     image_overlay_message: String,
+     app_started_at: std::time::Instant,
+     streaming: Option<StreamingSession>,
+@@ -488,11 +492,9 @@
+             streaming_target,
+             show_stream_key: false,
+             overlay_source: OverlaySource::default(),
+-            overlay_selected: false,
+-            overlay_resize_drag: false,
++            selected_preview_layer: None,
++            preview_resize_drag: false,
+             image_overlay: None,
+-            image_overlay_selected: false,
+-            image_overlay_resize_drag: false,
+             image_overlay_message: "画像オーバーレイ: 未追加".to_owned(),
+             app_started_at: std::time::Instant::now(),
+             streaming: None,
+@@ -1156,15 +1158,13 @@
+                 );
+ 
+                 if fish_response.clicked() {
+-                    self.overlay_selected = true;
+-                    self.image_overlay_selected = false;
++                    self.selected_preview_layer = Some(PreviewLayerSelection::Fish);
+                     overlay_interacted = true;
+                 }
+                 if fish_response.drag_started() {
+-                    self.overlay_selected = true;
+-                    self.image_overlay_selected = false;
++                    self.selected_preview_layer = Some(PreviewLayerSelection::Fish);
+                     overlay_interacted = true;
+-                    self.overlay_resize_drag = ui
++                    self.preview_resize_drag = ui
+                         .ctx()
+                         .pointer_interact_pos()
+                         .map(|p| handle_rect.expand(5.0).contains(p))
+@@ -1172,8 +1172,11 @@
+                 }
+                 if fish_response.dragged() {
+                     overlay_interacted = true;
+-                    let delta = fish_response.drag_delta();
+-                    if self.overlay_resize_drag {
++                    // egui::Response::drag_delta() is cumulative from drag start.
++                    // Applying that value every repaint makes transform editing unstable.
++                    // Use the pointer's per-frame delta while this layer owns the drag.
++                    let delta = ui.ctx().input(|i| i.pointer.delta());
++                    if self.preview_resize_drag {
+                         self.overlay_source.resize_by_preview_delta(
+                             delta.x,
+                             image_rect.width(),
+@@ -1192,10 +1195,10 @@
+                     }
+                 }
+                 if fish_response.drag_stopped() {
+-                    self.overlay_resize_drag = false;
++                    self.preview_resize_drag = false;
+                 }
+ 
+-                if self.overlay_selected {
++                if self.selected_preview_layer == Some(PreviewLayerSelection::Fish) {
+                     let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(100, 190, 255));
+                     ui.painter()
+                         .rect_stroke(fish_rect, 2.0, stroke, egui::StrokeKind::Outside);
+@@ -1230,15 +1233,13 @@
+                     );
+ 
+                     if image_response.clicked() {
+-                        self.image_overlay_selected = true;
+-                        self.overlay_selected = false;
++                        self.selected_preview_layer = Some(PreviewLayerSelection::Image);
+                         overlay_interacted = true;
+                     }
+                     if image_response.drag_started() {
+-                        self.image_overlay_selected = true;
+-                        self.overlay_selected = false;
++                        self.selected_preview_layer = Some(PreviewLayerSelection::Image);
+                         overlay_interacted = true;
+-                        self.image_overlay_resize_drag = ui
++                        self.preview_resize_drag = ui
+                             .ctx()
+                             .pointer_interact_pos()
+                             .map(|p| handle_rect.expand(5.0).contains(p))
+@@ -1246,8 +1247,8 @@
+                     }
+                     if image_response.dragged() {
+                         overlay_interacted = true;
+-                        let delta = image_response.drag_delta();
+-                        if self.image_overlay_resize_drag {
++                        let delta = ui.ctx().input(|i| i.pointer.delta());
++                        if self.preview_resize_drag {
+                             image_overlay.resize_by_preview_delta(
+                                 delta.x,
+                                 image_rect.width(),
+@@ -1266,10 +1267,10 @@
+                         }
+                     }
+                     if image_response.drag_stopped() {
+-                        self.image_overlay_resize_drag = false;
++                        self.preview_resize_drag = false;
+                     }
+ 
+-                    if self.image_overlay_selected {
++                    if self.selected_preview_layer == Some(PreviewLayerSelection::Image) {
+                         let stroke =
+                             egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(130, 220, 140));
+                         ui.painter().rect_stroke(
+@@ -1290,10 +1291,8 @@
+             if outer_response.clicked() && !overlay_interacted {
+                 if let Some(pointer) = outer_response.interact_pointer_pos() {
+                     if image_rect.contains(pointer) {
+-                        self.overlay_selected = false;
+-                        self.overlay_resize_drag = false;
+-                        self.image_overlay_selected = false;
+-                        self.image_overlay_resize_drag = false;
++                        self.selected_preview_layer = None;
++                        self.preview_resize_drag = false;
+                     }
+                 }
+             }
+@@ -1778,8 +1777,7 @@
+                                             source.name, source.pixel_width, source.pixel_height
+                                         );
+                                         self.image_overlay = Some(source);
+-                                        self.image_overlay_selected = true;
+-                                        self.overlay_selected = false;
++                                        self.selected_preview_layer = Some(PreviewLayerSelection::Image);
+                                     }
+                                     Err(err) => {
+                                         self.image_overlay_message = format!("画像追加失敗: {err}");
+@@ -1837,8 +1835,10 @@
+                     }
+                     if remove_image_overlay {
+                         self.image_overlay = None;
+-                        self.image_overlay_selected = false;
+-                        self.image_overlay_resize_drag = false;
++                        if self.selected_preview_layer == Some(PreviewLayerSelection::Image) {
++                            self.selected_preview_layer = None;
++                        }
++                        self.preview_resize_drag = false;
+                         self.image_overlay_message = "画像オーバーレイ: 未追加".to_owned();
+                     }
+ 

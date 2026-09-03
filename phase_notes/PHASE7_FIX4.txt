@@ -22,7 +22,7 @@ Changes:
 Run:
 cargo test --workspace
 cargo check --workspace
-cargo run -p yaoyorozu-stream
+cargo run -p tsubame
 
 Manual test:
 - Record 10-15 seconds.

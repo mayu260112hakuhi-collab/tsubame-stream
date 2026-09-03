@@ -1,0 +1,32 @@
+燕 / Tsubame - Phase 2 レイヤー基盤
+
+対象:
+  apps/tsubame/src/app.rs
+  apps/tsubame/src/scene.rs
+
+変更内容:
+- LayerId / LayerKind / SceneLayer を追加
+- ししゃもと追加画像に安定した LayerId を割り当て
+- プレビュー選択状態を LayerId ベースへ移行
+- レイヤー一覧UIを追加（上が手前）
+- レイヤーのロックを追加
+  - ロック中でも選択可能
+  - ドラッグ移動 / リサイズは無効
+- 画像を差し替えた時のレイヤーメタデータ更新
+- 画像削除時のレイヤーメタデータ削除
+
+現時点では:
+- 既存の OverlaySource / ImageOverlaySource は残しています
+- 合成処理そのものは従来のままです
+- 上下入れ替え / 複製 / Group / BGM / SVG は次段階です
+
+確認項目:
+1. cargo build --release が通る
+2. ししゃも移動・リサイズが引き続き動く
+3. 追加画像移動・リサイズが引き続き動く
+4. レイヤー一覧で選択できる
+5. 「ロック」ON時にプレビュー上で動かなくなる
+6. ロックOFFで再び動かせる
+
+注意:
+この環境には Cargo / rustfmt がないため、こちらではビルド確認していません。

@@ -10,6 +10,6 @@ Phase 9.2.3 Fix1
 ユーザー側確認:
     cargo test --workspace
     cargo check --workspace
-    cargo run -p yaoyorozu-stream
+    cargo run -p tsubame
 
 この環境ではCargo/Rustコンパイルは実行していません。

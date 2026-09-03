@@ -18,4 +18,4 @@ CPU 2.1% | RAM 184 MB | 60.0 FPS | Preview Drop 0
 - Preview Dropはプレビューworkerのjob dropであり、YouTube側のnetwork/drop統計ではない。
 - 配信drop / dup / bitrate / speedはFFmpeg統計取得を実装する後続Phaseで追加予定。
 
-Version: yaoyorozu-stream 0.16.2
+Version: tsubame 0.16.2

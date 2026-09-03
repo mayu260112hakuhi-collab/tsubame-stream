@@ -1,5 +1,56 @@
 use std::path::{Path, PathBuf};
 
+
+pub type LayerId = u64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerKind {
+    FishOverlay,
+    Image,
+    Capture,
+    Camera,
+    Text,
+    Audio,
+    InputOverlay,
+    Browser,
+    Group,
+}
+
+impl LayerKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FishOverlay => "テスト",
+            Self::Image => "画像",
+            Self::Capture => "キャプチャ",
+            Self::Camera => "カメラ",
+            Self::Text => "テキスト",
+            Self::Audio => "音声",
+            Self::InputOverlay => "入力表示",
+            Self::Browser => "Web",
+            Self::Group => "グループ",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SceneLayer {
+    pub id: LayerId,
+    pub kind: LayerKind,
+    pub name: String,
+    pub locked: bool,
+}
+
+impl SceneLayer {
+    pub fn new(id: LayerId, kind: LayerKind, name: impl Into<String>) -> Self {
+        Self {
+            id,
+            kind,
+            name: name.into(),
+            locked: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OverlaySource {
     pub enabled: bool,
@@ -172,13 +223,24 @@ impl ImageOverlaySource {
     const MAX_WIDTH_PERCENT: f32 = 80.0;
 
     pub fn load(path: &Path) -> Result<Self, String> {
-        let decoded = image::open(path)
-            .map_err(|err| format!("画像を開けませんでした: {err}"))?
-            .to_rgba8();
-        let (pixel_width, pixel_height) = decoded.dimensions();
-        if pixel_width == 0 || pixel_height == 0 {
-            return Err("画像サイズが0です".to_owned());
-        }
+        let is_svg = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("svg"))
+            .unwrap_or(false);
+
+        let (pixel_width, pixel_height, rgba) = if is_svg {
+            Self::load_svg(path)?
+        } else {
+            let decoded = image::open(path)
+                .map_err(|err| format!("画像を開けませんでした: {err}"))?
+                .to_rgba8();
+            let (pixel_width, pixel_height) = decoded.dimensions();
+            if pixel_width == 0 || pixel_height == 0 {
+                return Err("画像サイズが0です".to_owned());
+            }
+            (pixel_width, pixel_height, decoded.into_raw())
+        };
 
         Ok(Self {
             enabled: true,
@@ -193,8 +255,52 @@ impl ImageOverlaySource {
             width_percent: 24.0,
             pixel_width,
             pixel_height,
-            rgba: decoded.into_raw(),
+            rgba,
         })
+    }
+
+    fn load_svg(path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
+        const SVG_RASTER_MIN_LONG_EDGE: f32 = 1024.0;
+        const SVG_RASTER_MAX_LONG_EDGE: f32 = 2048.0;
+
+        let data = std::fs::read(path)
+            .map_err(|err| format!("SVGを読み込めませんでした: {err}"))?;
+
+        let mut options = resvg::usvg::Options::default();
+        options.fontdb_mut().load_system_fonts();
+
+        let tree = resvg::usvg::Tree::from_data(&data, &options)
+            .map_err(|err| format!("SVGを解析できませんでした: {err}"))?;
+
+        let size = tree.size();
+        let source_width = size.width();
+        let source_height = size.height();
+        if source_width <= 0.0 || source_height <= 0.0 {
+            return Err("SVGサイズが0です".to_owned());
+        }
+
+        // 現行の合成器はRGBAキャッシュを使うため、SVGは読み込み時に一度だけ
+        // 高解像度へラスタライズする。小さなSVGも長辺1024px程度まで引き上げ、
+        // 極端に大きいSVGは長辺2048pxに制限してメモリ使用量を抑える。
+        let source_long_edge = source_width.max(source_height);
+        let target_long_edge = source_long_edge
+            .clamp(SVG_RASTER_MIN_LONG_EDGE, SVG_RASTER_MAX_LONG_EDGE);
+        let scale = target_long_edge / source_long_edge;
+
+        let pixel_width = (source_width * scale).round().max(1.0) as u32;
+        let pixel_height = (source_height * scale).round().max(1.0) as u32;
+
+        let mut pixmap = resvg::tiny_skia::Pixmap::new(pixel_width, pixel_height)
+            .ok_or_else(|| "SVG描画バッファを作成できませんでした".to_owned())?;
+
+        let transform = resvg::tiny_skia::Transform::from_scale(scale, scale);
+        resvg::render(&tree, transform, &mut pixmap.as_mut());
+
+        // tiny-skia は premultiplied RGBA。燕の既存アルファ合成は straight RGBA
+        // を前提にしているため、ここで demultiply して既存PNG等と同じ形式に揃える。
+        let rgba = pixmap.take_demultiplied();
+
+        Ok((pixel_width, pixel_height, rgba))
     }
 
     pub fn aspect(&self) -> f32 {

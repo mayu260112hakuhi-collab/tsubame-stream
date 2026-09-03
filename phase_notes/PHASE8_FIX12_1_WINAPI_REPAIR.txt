@@ -12,7 +12,7 @@ Repair:
 Run:
 cargo test --workspace
 cargo check --workspace
-cargo run -p yaoyorozu-stream
+cargo run -p tsubame
 
 If the next compiler error is a D3D11 signature/type mismatch, send the
 complete output unchanged.

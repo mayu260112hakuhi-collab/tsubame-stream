@@ -1,0 +1,464 @@
+--- a/apps/tsubame/src/app.rs
++++ b/apps/tsubame/src/app.rs
+@@ -1,4 +1,5 @@
+ use crate::addon::{AddonOrigin, AddonRegistry, ADDON_API_VERSION};
++use crate::bgm::{BgmLayerSource, BgmPlayer};
+ use crate::scene::{ImageOverlaySource, LayerId, LayerKind, OverlaySource, SceneLayer};
+ use crate::settings::{load_settings, save_settings, AppSettings};
+ use crate::streaming::{StreamingPlatform, StreamingSession, StreamingTargetConfig};
+@@ -9,6 +10,7 @@
+ use crate::view_model::StreamViewModel;
+ use eframe::egui;
+ use std::{
++    collections::HashMap,
+     fs,
+     path::PathBuf,
+     sync::mpsc,
+@@ -395,6 +397,45 @@
+     files
+ }
+ 
++fn ensure_bgm_library_dir() -> PathBuf {
++    let root = bundle_subdir("bgm");
++    let _ = fs::create_dir_all(&root);
++    root
++}
++
++fn is_supported_bgm(path: &std::path::Path) -> bool {
++    path.extension()
++        .and_then(|ext| ext.to_str())
++        .map(|ext| matches!(ext.to_ascii_lowercase().as_str(), "mp3" | "wav" | "ogg" | "flac"))
++        .unwrap_or(false)
++}
++
++fn scan_bgm_library(root: &std::path::Path) -> Vec<PathBuf> {
++    fn visit(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
++        let Ok(entries) = fs::read_dir(dir) else {
++            return;
++        };
++        for entry in entries.flatten() {
++            let path = entry.path();
++            if path.is_dir() {
++                visit(&path, out);
++            } else if is_supported_bgm(&path) {
++                out.push(path);
++            }
++        }
++    }
++
++    let mut files = Vec::new();
++    visit(root, &mut files);
++    files.sort_by_key(|path| {
++        path.file_name()
++            .and_then(|name| name.to_str())
++            .unwrap_or_default()
++            .to_ascii_lowercase()
++    });
++    files
++}
++
+ pub struct YaoyorozuApp {
+     vm: StreamViewModel,
+     elapsed_ms: u64,
+@@ -435,6 +476,12 @@
+     image_library_dir: PathBuf,
+     image_library_files: Vec<PathBuf>,
+     image_library_message: String,
++    bgm_layers: Vec<(LayerId, BgmLayerSource)>,
++    bgm_players: HashMap<LayerId, BgmPlayer>,
++    bgm_library_dir: PathBuf,
++    bgm_library_files: Vec<PathBuf>,
++    bgm_library_message: String,
++    bgm_message: String,
+     app_started_at: std::time::Instant,
+     streaming: Option<StreamingSession>,
+     streaming_message: String,
+@@ -499,6 +546,70 @@
+         }
+     }
+ 
++    fn add_bgm_layer(&mut self, source: BgmLayerSource) -> LayerId {
++        let id = self.allocate_layer_id();
++        self.layers
++            .push(SceneLayer::new(id, LayerKind::Audio, source.name.clone()));
++        self.bgm_layers.push((id, source));
++        id
++    }
++
++    fn remove_bgm_layer(&mut self, id: LayerId) {
++        if let Some(player) = self.bgm_players.remove(&id) {
++            player.stop();
++        }
++        self.layers.retain(|layer| layer.id != id);
++        self.bgm_layers.retain(|(layer_id, _)| *layer_id != id);
++        if self.selected_layer == Some(id) {
++            self.selected_layer = None;
++        }
++    }
++
++    fn refresh_bgm_library(&mut self) {
++        self.bgm_library_files = scan_bgm_library(&self.bgm_library_dir);
++        self.bgm_library_message = format!(
++            "BGMライブラリ: {} 曲 / {}",
++            self.bgm_library_files.len(),
++            self.bgm_library_dir.display()
++        );
++    }
++
++    fn add_bgm_from_path(&mut self, path: &std::path::Path) {
++        if !is_supported_bgm(path) {
++            self.bgm_message = "BGM追加失敗: 未対応の音声形式です".to_owned();
++            return;
++        }
++        let source = BgmLayerSource::from_path(path);
++        let name = source.name.clone();
++        let id = self.add_bgm_layer(source);
++        self.selected_layer = Some(id);
++        self.bgm_message = format!("BGM追加: {name} / 合計 {} 曲", self.bgm_layers.len());
++    }
++
++    fn play_bgm_layer(&mut self, id: LayerId) {
++        let Some((_, source)) = self.bgm_layers.iter().find(|(layer_id, _)| *layer_id == id) else {
++            return;
++        };
++        if !source.enabled {
++            self.bgm_message = "BGM再生: レイヤーが無効です".to_owned();
++            return;
++        }
++        let path = source.path.clone();
++        let loop_enabled = source.loop_enabled;
++        let volume = source.volume_linear();
++        let name = source.name.clone();
++        match BgmPlayer::play_file(&path, loop_enabled, volume) {
++            Ok(player) => {
++                if let Some(old) = self.bgm_players.insert(id, player) {
++                    old.stop();
++                }
++                self.bgm_message = format!("BGM再生中: {name}");
++            }
++            Err(err) => {
++                self.bgm_message = format!("BGM再生失敗: {err}");
++            }
++        }
++    }
+ 
+     fn refresh_image_library(&mut self) {
+         self.image_library_files = scan_image_library(&self.image_library_dir);
+@@ -620,6 +731,13 @@
+             image_library_files.len(),
+             image_library_dir.display()
+         );
++        let bgm_library_dir = ensure_bgm_library_dir();
++        let bgm_library_files = scan_bgm_library(&bgm_library_dir);
++        let bgm_library_message = format!(
++            "BGMライブラリ: {} 曲 / {}",
++            bgm_library_files.len(),
++            bgm_library_dir.display()
++        );
+ 
+         Self {
+             vm,
+@@ -658,6 +776,12 @@
+             image_library_dir,
+             image_library_files,
+             image_library_message,
++            bgm_layers: Vec::new(),
++            bgm_players: HashMap::new(),
++            bgm_library_dir,
++            bgm_library_files,
++            bgm_library_message,
++            bgm_message: "BGM: 未追加".to_owned(),
+             app_started_at: std::time::Instant::now(),
+             streaming: None,
+             streaming_message: "配信: 待機中".to_owned(),
+@@ -1715,6 +1839,7 @@
+ 
+ impl eframe::App for YaoyorozuApp {
+     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
++        self.bgm_players.retain(|_, player| !player.is_finished());
+         self.poll_recording_finalize();
+         self.poll_streaming();
+         self.performance.refresh_if_due();
+@@ -2080,6 +2205,168 @@
+                             }
+                         });
+ 
++                    ui.add_space(6.0);
++                    egui::CollapsingHeader::new("BGMライブラリ")
++                        .id_salt("bgm_library")
++                        .default_open(true)
++                        .show(ui, |ui| {
++                            ui.horizontal_wrapped(|ui| {
++                                if ui.button("更新").clicked() {
++                                    self.refresh_bgm_library();
++                                }
++                                if ui.button("＋ BGM").clicked() {
++                                    if let Some(path) = rfd::FileDialog::new()
++                                        .add_filter("BGM", &["mp3", "wav", "ogg", "flac"])
++                                        .pick_file()
++                                    {
++                                        self.add_bgm_from_path(&path);
++                                    }
++                                }
++                                #[cfg(target_os = "windows")]
++                                if ui.button("フォルダを開く").clicked() {
++                                    let _ = std::process::Command::new("explorer")
++                                        .arg(&self.bgm_library_dir)
++                                        .spawn();
++                                }
++                            });
++                            ui.small(&self.bgm_library_message);
++                            ui.small("bgm/ に MP3 / WAV / OGG / FLAC を入れて「更新」。追加すると音声レイヤーになります。");
++
++                            let mut add_bgm_from_library: Option<PathBuf> = None;
++                            egui::ScrollArea::vertical()
++                                .id_salt("bgm_library_files")
++                                .max_height(130.0)
++                                .show(ui, |ui| {
++                                    if self.bgm_library_files.is_empty() {
++                                        ui.small("まだBGMがありません。bgm/ に音源を入れて「更新」を押してください。");
++                                    } else {
++                                        for path in &self.bgm_library_files {
++                                            let relative = path
++                                                .strip_prefix(&self.bgm_library_dir)
++                                                .unwrap_or(path.as_path());
++                                            ui.horizontal(|ui| {
++                                                if ui.small_button("追加").clicked() {
++                                                    add_bgm_from_library = Some(path.clone());
++                                                }
++                                                ui.label(relative.display().to_string());
++                                            });
++                                        }
++                                    }
++                                });
++                            if let Some(path) = add_bgm_from_library {
++                                self.add_bgm_from_path(&path);
++                            }
++                        });
++
++                    let selected_bgm_id = self.selected_layer.and_then(|selected_id| {
++                        self.layers
++                            .iter()
++                            .find(|layer| layer.id == selected_id && layer.kind == LayerKind::Audio)
++                            .map(|layer| layer.id)
++                    });
++                    let mut bgm_play = false;
++                    let mut bgm_pause_resume = false;
++                    let mut bgm_stop = false;
++                    let mut bgm_remove = false;
++                    let mut bgm_restart_for_loop = false;
++                    let mut bgm_volume_change: Option<f32> = None;
++                    if let Some(bgm_layer_id) = selected_bgm_id {
++                        if let Some(bgm_index) = self
++                            .bgm_layers
++                            .iter()
++                            .position(|(id, _)| *id == bgm_layer_id)
++                        {
++                            let is_active = self.bgm_players.contains_key(&bgm_layer_id);
++                            let is_paused = self
++                                .bgm_players
++                                .get(&bgm_layer_id)
++                                .map(|player| player.is_paused())
++                                .unwrap_or(false);
++                            egui::CollapsingHeader::new("選択BGM")
++                                .id_salt(("bgm_controls", bgm_layer_id))
++                                .default_open(true)
++                                .show(ui, |ui| {
++                                    let source = &mut self.bgm_layers[bgm_index].1;
++                                    ui.horizontal_wrapped(|ui| {
++                                        if ui.checkbox(&mut source.enabled, "有効").changed() && !source.enabled {
++                                            bgm_stop = true;
++                                        }
++                                        ui.label(&source.name);
++                                        if ui.button("削除").clicked() {
++                                            bgm_remove = true;
++                                        }
++                                    });
++                                    ui.small(source.path.display().to_string());
++                                    ui.horizontal_wrapped(|ui| {
++                                        if ui.button("▶ 再生").clicked() {
++                                            bgm_play = true;
++                                        }
++                                        if ui
++                                            .add_enabled(
++                                                is_active,
++                                                egui::Button::new(if is_paused { "▶ 再開" } else { "⏸ 一時停止" }),
++                                            )
++                                            .clicked()
++                                        {
++                                            bgm_pause_resume = true;
++                                        }
++                                        if ui.add_enabled(is_active, egui::Button::new("■ 停止")).clicked() {
++                                            bgm_stop = true;
++                                        }
++                                    });
++                                    ui.horizontal(|ui| {
++                                        ui.label("音量");
++                                        if ui
++                                            .add(egui::Slider::new(&mut source.volume_percent, 0.0..=100.0).suffix("%"))
++                                            .changed()
++                                        {
++                                            bgm_volume_change = Some(source.volume_linear());
++                                        }
++                                    });
++                                    if ui.checkbox(&mut source.loop_enabled, "ループ再生").changed() && is_active {
++                                        bgm_restart_for_loop = true;
++                                    }
++                                });
++                        }
++                    }
++                    if let Some(bgm_layer_id) = selected_bgm_id {
++                        if let Some(volume) = bgm_volume_change {
++                            if let Some(player) = self.bgm_players.get(&bgm_layer_id) {
++                                player.set_volume(volume);
++                            }
++                        }
++                        if bgm_remove {
++                            self.remove_bgm_layer(bgm_layer_id);
++                            self.bgm_message = if self.bgm_layers.is_empty() {
++                                "BGM: 未追加".to_owned()
++                            } else {
++                                format!("BGM削除 / 残り {} 曲", self.bgm_layers.len())
++                            };
++                        } else {
++                            if bgm_stop {
++                                if let Some(player) = self.bgm_players.remove(&bgm_layer_id) {
++                                    player.stop();
++                                }
++                                self.bgm_message = "BGM: 停止".to_owned();
++                            }
++                            if bgm_pause_resume {
++                                if let Some(player) = self.bgm_players.get(&bgm_layer_id) {
++                                    if player.is_paused() {
++                                        player.resume();
++                                        self.bgm_message = "BGM: 再開".to_owned();
++                                    } else {
++                                        player.pause();
++                                        self.bgm_message = "BGM: 一時停止".to_owned();
++                                    }
++                                }
++                            }
++                            if bgm_play || bgm_restart_for_loop {
++                                self.play_bgm_layer(bgm_layer_id);
++                            }
++                        }
++                    }
++                    ui.small(&self.bgm_message);
++
+                     let selected_image_id = self.selected_layer.and_then(|selected_id| {
+                         self.layers
+                             .iter()
+--- a/apps/tsubame/Cargo.toml
++++ b/apps/tsubame/Cargo.toml
+@@ -11,6 +11,7 @@
+ eframe = "0.32"
+ image = "0.25"
+ resvg = "0.48.1"
++rodio = "0.20"
+ rfd = "0.15"
+ sysinfo = "0.38"
+ serde = { version = "1", features = ["derive"] }
+--- a/apps/tsubame/src/lib.rs
++++ b/apps/tsubame/src/lib.rs
+@@ -1,5 +1,6 @@
+ pub mod addon;
+ pub mod app;
++pub mod bgm;
+ pub mod scene;
+ pub mod settings;
+ pub mod streaming;
+--- /dev/null
++++ b/apps/tsubame/src/bgm.rs
+@@ -0,0 +1,92 @@
++use rodio::{Decoder, OutputStream, Sink, Source};
++use std::{
++    fs::File,
++    io::BufReader,
++    path::{Path, PathBuf},
++};
++
++#[derive(Debug, Clone)]
++pub struct BgmLayerSource {
++    pub enabled: bool,
++    pub name: String,
++    pub path: PathBuf,
++    pub volume_percent: f32,
++    pub loop_enabled: bool,
++}
++
++impl BgmLayerSource {
++    pub fn from_path(path: &Path) -> Self {
++        Self {
++            enabled: true,
++            name: path
++                .file_name()
++                .and_then(|name| name.to_str())
++                .unwrap_or("BGM")
++                .to_owned(),
++            path: path.to_path_buf(),
++            volume_percent: 70.0,
++            loop_enabled: true,
++        }
++    }
++
++    pub fn volume_linear(&self) -> f32 {
++        (self.volume_percent / 100.0).clamp(0.0, 1.0)
++    }
++}
++
++pub struct BgmPlayer {
++    // OutputStream must stay alive while Sink is playing.
++    _stream: OutputStream,
++    sink: Sink,
++}
++
++impl BgmPlayer {
++    pub fn play_file(path: &Path, loop_enabled: bool, volume: f32) -> Result<Self, String> {
++        let (stream, stream_handle) = OutputStream::try_default()
++            .map_err(|err| format!("BGM出力デバイスを開けませんでした: {err}"))?;
++        let sink = Sink::try_new(&stream_handle)
++            .map_err(|err| format!("BGM再生を開始できませんでした: {err}"))?;
++
++        let file = File::open(path)
++            .map_err(|err| format!("BGMファイルを開けませんでした: {err}"))?;
++        let decoder = Decoder::new(BufReader::new(file))
++            .map_err(|err| format!("BGMをデコードできませんでした: {err}"))?;
++
++        if loop_enabled {
++            sink.append(decoder.repeat_infinite());
++        } else {
++            sink.append(decoder);
++        }
++        sink.set_volume(volume.clamp(0.0, 1.0));
++        sink.play();
++
++        Ok(Self {
++            _stream: stream,
++            sink,
++        })
++    }
++
++    pub fn pause(&self) {
++        self.sink.pause();
++    }
++
++    pub fn resume(&self) {
++        self.sink.play();
++    }
++
++    pub fn stop(&self) {
++        self.sink.stop();
++    }
++
++    pub fn set_volume(&self, volume: f32) {
++        self.sink.set_volume(volume.clamp(0.0, 1.0));
++    }
++
++    pub fn is_paused(&self) -> bool {
++        self.sink.is_paused()
++    }
++
++    pub fn is_finished(&self) -> bool {
++        self.sink.empty()
++    }
++}

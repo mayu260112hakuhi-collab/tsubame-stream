@@ -24,4 +24,4 @@ Yaoyorozu Stream Phase 9.2.1 Fix1 - マイクメーター起動修正
 4. PC音声メーターが従来通り動くか確認。
 5. cargo test --workspace
 6. cargo check --workspace
-7. cargo run -p yaoyorozu-stream
+7. cargo run -p tsubame

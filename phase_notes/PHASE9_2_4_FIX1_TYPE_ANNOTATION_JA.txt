@@ -8,4 +8,4 @@ Phase 9.2.4 Fix1
 ユーザー環境で確認:
   cargo test --workspace
   cargo check --workspace
-  cargo run -p yaoyorozu-stream
+  cargo run -p tsubame

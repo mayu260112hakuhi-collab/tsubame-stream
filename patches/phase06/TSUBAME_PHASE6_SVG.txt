@@ -1,0 +1,41 @@
+燕 / Tsubame - Phase 6 SVG画像レイヤー対応
+
+対象:
+  apps/tsubame/src/app.rs
+  apps/tsubame/src/scene.rs
+  apps/tsubame/Cargo.toml
+
+追加:
+- SVGを画像レイヤーとして読み込み可能
+- image/ 素材ライブラリで .svg を自動認識
+- 「＋ 画像」ファイル選択でも SVG を選択可能
+- resvg 0.48.1 を使用してSVGを読み込み時に一度だけラスタライズ
+- 小さいSVGは長辺1024px程度まで高解像度化
+- 大きすぎるSVGは長辺2048pxに制限してメモリ消費を抑制
+- tiny-skiaのpremultiplied RGBAをdemultiplyして、既存PNG/JPGと同じ合成経路へ統一
+- SVG内テキスト向けにシステムフォントを読み込み
+
+Phase 5までの機能は維持:
+- 複数画像レイヤー
+- 移動 / リサイズ
+- 表示ON/OFF
+- ロック
+- 削除
+- 手前 / 奥へ
+- image/ 自動素材ライブラリ
+
+テスト:
+1. apps/tsubame/Cargo.toml も必ず差し替える
+2. cargo build --release
+3. image/overlay/ 等へSVGを入れる
+4. 「更新」でSVGが一覧に出る
+5. 「追加」でSVGがプレビューへ出る
+6. 移動 / リサイズ / ロック / 前後入替を確認
+7. 透過部分や半透明の縁が黒ずまないことを確認
+8. PNGとSVGを重ねても前後関係が正常なことを確認
+
+補足:
+- 現段階では「SVGを編集するUI」はまだありません。SVGファイルを外部エディタで編集して再読み込みする方式です。
+- 現行の合成器に合わせ、SVGはロード時にRGBAへキャッシュします。毎フレームSVG解析は行いません。
+- 外部ファイル参照に依存しない、単体で完結したSVGを推奨します。
+- この環境には Cargo / rustfmt がないため、こちらではビルド確認していません。

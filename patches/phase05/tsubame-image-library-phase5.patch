@@ -1,0 +1,219 @@
+--- /mnt/data/app_phase4.rs	2026-09-03 11:19:45.811979815 +0000
++++ /mnt/data/app_phase5.rs	2026-09-03 11:39:17.568445795 +0000
+@@ -338,6 +338,63 @@
+     }
+ }
+ 
++
++fn bundle_subdir(name: &str) -> PathBuf {
++    let base = std::env::current_exe()
++        .ok()
++        .and_then(|path| path.parent().map(|parent| parent.to_path_buf()))
++        .or_else(|| std::env::current_dir().ok())
++        .unwrap_or_else(|| PathBuf::from("."));
++    base.join(name)
++}
++
++fn ensure_image_library_dir() -> PathBuf {
++    let root = bundle_subdir("image");
++    let _ = fs::create_dir_all(&root);
++    for child in ["background", "overlay", "wipe", "thumbnail"] {
++        let _ = fs::create_dir_all(root.join(child));
++    }
++    root
++}
++
++fn is_supported_library_image(path: &std::path::Path) -> bool {
++    path.extension()
++        .and_then(|ext| ext.to_str())
++        .map(|ext| {
++            matches!(
++                ext.to_ascii_lowercase().as_str(),
++                "png" | "jpg" | "jpeg" | "webp" | "bmp"
++            )
++        })
++        .unwrap_or(false)
++}
++
++fn scan_image_library(root: &std::path::Path) -> Vec<PathBuf> {
++    fn visit(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
++        let Ok(entries) = fs::read_dir(dir) else {
++            return;
++        };
++        for entry in entries.flatten() {
++            let path = entry.path();
++            if path.is_dir() {
++                visit(&path, out);
++            } else if is_supported_library_image(&path) {
++                out.push(path);
++            }
++        }
++    }
++
++    let mut files = Vec::new();
++    visit(root, &mut files);
++    files.sort_by_key(|path| {
++        path.file_name()
++            .and_then(|name| name.to_str())
++            .unwrap_or_default()
++            .to_ascii_lowercase()
++    });
++    files
++}
++
+ pub struct YaoyorozuApp {
+     vm: StreamViewModel,
+     elapsed_ms: u64,
+@@ -375,6 +432,9 @@
+     preview_resize_drag: bool,
+     image_overlays: Vec<(LayerId, ImageOverlaySource)>,
+     image_overlay_message: String,
++    image_library_dir: PathBuf,
++    image_library_files: Vec<PathBuf>,
++    image_library_message: String,
+     app_started_at: std::time::Instant,
+     streaming: Option<StreamingSession>,
+     streaming_message: String,
+@@ -439,6 +499,40 @@
+         }
+     }
+ 
++
++    fn refresh_image_library(&mut self) {
++        self.image_library_files = scan_image_library(&self.image_library_dir);
++        self.image_library_message = format!(
++            "画像ライブラリ: {} 枚 / {}",
++            self.image_library_files.len(),
++            self.image_library_dir.display()
++        );
++    }
++
++    fn add_image_from_path(&mut self, path: &std::path::Path) {
++        match ImageOverlaySource::load(path) {
++            Ok(mut source) => {
++                source.clamp_to_frame(self.preview_size[0], self.preview_size[1]);
++                let source_name = source.name.clone();
++                let pixel_width = source.pixel_width;
++                let pixel_height = source.pixel_height;
++                let layer_id = self.add_image_layer(source);
++                self.selected_layer = Some(layer_id);
++                self.preview_resize_drag = false;
++                self.image_overlay_message = format!(
++                    "画像追加: {} ({}×{}) / 合計 {} 枚",
++                    source_name,
++                    pixel_width,
++                    pixel_height,
++                    self.image_overlays.len()
++                );
++            }
++            Err(err) => {
++                self.image_overlay_message = format!("画像追加失敗: {err}");
++            }
++        }
++    }
++
+     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+         apply_accessible_ui_style(&cc.egui_ctx);
+         let font_message = match install_windows_japanese_font(&cc.egui_ctx) {
+@@ -519,6 +613,14 @@
+             "ししゃも（テスト）",
+         )];
+ 
++        let image_library_dir = ensure_image_library_dir();
++        let image_library_files = scan_image_library(&image_library_dir);
++        let image_library_message = format!(
++            "画像ライブラリ: {} 枚 / {}",
++            image_library_files.len(),
++            image_library_dir.display()
++        );
++
+         Self {
+             vm,
+             elapsed_ms: 0,
+@@ -553,6 +655,9 @@
+             preview_resize_drag: false,
+             image_overlays: Vec::new(),
+             image_overlay_message: "画像オーバーレイ: 未追加".to_owned(),
++            image_library_dir,
++            image_library_files,
++            image_library_message,
+             app_started_at: std::time::Instant::now(),
+             streaming: None,
+             streaming_message: "配信: 待機中".to_owned(),
+@@ -1925,31 +2030,56 @@
+                                 .add_filter("画像", &["png", "jpg", "jpeg", "webp", "bmp"])
+                                 .pick_file()
+                             {
+-                                match ImageOverlaySource::load(&path) {
+-                                    Ok(mut source) => {
+-                                        source.clamp_to_frame(self.preview_size[0], self.preview_size[1]);
+-                                        let source_name = source.name.clone();
+-                                        let pixel_width = source.pixel_width;
+-                                        let pixel_height = source.pixel_height;
+-                                        let layer_id = self.add_image_layer(source);
+-                                        self.selected_layer = Some(layer_id);
+-                                        self.image_overlay_message = format!(
+-                                            "画像追加: {} ({}×{}) / 合計 {} 枚",
+-                                            source_name,
+-                                            pixel_width,
+-                                            pixel_height,
+-                                            self.image_overlays.len()
+-                                        );
+-                                    }
+-                                    Err(err) => {
+-                                        self.image_overlay_message = format!("画像追加失敗: {err}");
+-                                    }
+-                                }
++                                self.add_image_from_path(&path);
+                             }
+                         }
+                         ui.small(&self.image_overlay_message);
+                     });
+ 
++                    egui::CollapsingHeader::new("画像ライブラリ")
++                        .id_salt("image_library")
++                        .default_open(true)
++                        .show(ui, |ui| {
++                            ui.horizontal_wrapped(|ui| {
++                                if ui.button("更新").clicked() {
++                                    self.refresh_image_library();
++                                }
++                                #[cfg(target_os = "windows")]
++                                if ui.button("フォルダを開く").clicked() {
++                                    let _ = std::process::Command::new("explorer")
++                                        .arg(&self.image_library_dir)
++                                        .spawn();
++                                }
++                            });
++                            ui.small(&self.image_library_message);
++                            ui.small("image/ に入れた画像を自動認識します。background / overlay / wipe / thumbnail の各フォルダも使用できます。");
++
++                            let mut add_from_library: Option<PathBuf> = None;
++                            egui::ScrollArea::vertical()
++                                .id_salt("image_library_files")
++                                .max_height(150.0)
++                                .show(ui, |ui| {
++                                    if self.image_library_files.is_empty() {
++                                        ui.small("まだ画像がありません。image/ に画像を入れて「更新」を押してください。");
++                                    } else {
++                                        for path in &self.image_library_files {
++                                            let relative = path
++                                                .strip_prefix(&self.image_library_dir)
++                                                .unwrap_or(path.as_path());
++                                            ui.horizontal(|ui| {
++                                                if ui.small_button("追加").clicked() {
++                                                    add_from_library = Some(path.clone());
++                                                }
++                                                ui.label(relative.display().to_string());
++                                            });
++                                        }
++                                    }
++                                });
++                            if let Some(path) = add_from_library {
++                                self.add_image_from_path(&path);
++                            }
++                        });
++
+                     let selected_image_id = self.selected_layer.and_then(|selected_id| {
+                         self.layers
+                             .iter()

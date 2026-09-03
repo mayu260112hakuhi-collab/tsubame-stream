@@ -1,4 +1,6 @@
-use yaoyorozu_stream::app::YaoyorozuApp;
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
+use tsubame_stream::app::YaoyorozuApp;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {

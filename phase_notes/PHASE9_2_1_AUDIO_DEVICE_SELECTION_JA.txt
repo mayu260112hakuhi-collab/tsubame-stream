@@ -21,7 +21,7 @@ Yaoyorozu Stream Phase 9.2.1 — 音声デバイス選択
 確認コマンド（Windows）:
   cargo test --workspace
   cargo check --workspace
-  cargo run -p yaoyorozu-stream
+  cargo run -p tsubame
 
 注意:
 生成環境にはRust/Cargoが無いため、このzip自体ではcargo test/cargo checkを実行できていません。

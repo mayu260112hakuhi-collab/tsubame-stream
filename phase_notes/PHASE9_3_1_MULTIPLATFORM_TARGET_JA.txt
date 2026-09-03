@@ -21,4 +21,4 @@ Yaoyorozu Stream Phase 9.3.1 - YouTube / Twitch 配信先基盤
 確認:
 cargo test --workspace
 cargo check --workspace
-cargo run -p yaoyorozu-stream
+cargo run -p tsubame

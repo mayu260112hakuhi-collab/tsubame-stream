@@ -114,7 +114,7 @@ cargo run --release
 ビルドされた実行ファイル:
 
 ```text
-target\release\yaoyorozu-stream.exe
+target\release\tsubame.exe
 ```
 
 ### 注意
@@ -128,7 +128,7 @@ target\release\yaoyorozu-stream.exe
 
 ### プロジェクト名について
 
-内部のCargo package名には、過去の開発名である `yaoyorozu-stream` が残っている箇所があります。  
+内部のCargo package名には、過去の開発名である `tsubame` が残っている箇所があります。  
 製品名・公開名は **燕 / Tsubame** です。
 
 ---
@@ -234,7 +234,7 @@ cargo run --release
 Built executable:
 
 ```text
-target\release\yaoyorozu-stream.exe
+target\release\tsubame.exe
 ```
 
 ### Notes
@@ -248,7 +248,7 @@ This project is still under development.
 
 ### Project Name
 
-Some internal Cargo package names still use the historical development name `yaoyorozu-stream`.  
+Some internal Cargo package names still use the historical development name `tsubame`.  
 The public product name is **燕 / Tsubame**.
 
 ---

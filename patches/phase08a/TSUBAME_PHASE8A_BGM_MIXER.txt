@@ -1,0 +1,32 @@
+燕 / Tsubame - Phase 8A BGMミキサー統合
+
+対象:
+  apps/tsubame/src/app.rs
+  apps/tsubame/src/bgm.rs
+
+変更:
+- BGMレイヤーを音声ミキサーへ同一サイズのチャンネルストリップとして表示
+- BGMストリップから音量を直接変更
+- BGMストリップからMute ON/OFF
+- 選択BGM側にもMuteを追加し、ミキサーと同じ状態を共有
+- BGMストリップの削除からBGMレイヤーを削除可能
+- 再生開始時もMute状態を反映
+
+Phase 8Aの範囲:
+- BGMはまだWindows既定出力へ再生され、PC音声キャプチャ経由で配信Mixへ入ります。
+- BGMストリップのMix/WAVはまだ無効です。
+- BGMの実音量メーターはまだ未接続のため -60 dB表示です。
+- 直接PCM Mix / 個別WAV / 実メーターはPhase 8Bで実装します。
+
+テスト:
+1. cargo build --release
+2. BGMを追加・再生
+3. 音声ミキサーにBGMストリップが出る
+4. ミキサーのBGMフェーダーで音量が変わる
+5. Mute ONで無音、OFFで元の音量へ戻る
+6. 選択BGM側の音量/Muteとミキサー側が同期する
+7. BGMストリップの「削除」で対象BGMだけ消える
+8. PC音声/マイク/アプリ/Masterの既存操作が壊れていない
+
+注意:
+この環境にはCargo/rustfmtがないため、こちらではビルド確認していません。

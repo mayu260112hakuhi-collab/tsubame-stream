@@ -1,0 +1,125 @@
+--- apps/tsubame/src/app.rs
++++ apps/tsubame/src/app.rs
+@@ -404,6 +404,24 @@
+             .find(|layer| layer.id == id)
+             .map(|layer| layer.locked)
+             .unwrap_or(false)
++    }
++
++    fn move_layer_toward_front(&mut self, id: LayerId) {
++        let Some(index) = self.layers.iter().position(|layer| layer.id == id) else {
++            return;
++        };
++        if index + 1 < self.layers.len() {
++            self.layers.swap(index, index + 1);
++        }
++    }
++
++    fn move_layer_toward_back(&mut self, id: LayerId) {
++        let Some(index) = self.layers.iter().position(|layer| layer.id == id) else {
++            return;
++        };
++        if index > 0 {
++            self.layers.swap(index, index - 1);
++        }
+     }
+ 
+     fn replace_image_layer(&mut self, name: String) -> LayerId {
+@@ -766,24 +784,40 @@
+             return;
+         }
+ 
+-        let overlay_enabled = self.overlay_source.enabled
+-            || self
++        let overlay_enabled = self.layers.iter().any(|layer| match layer.kind {
++            LayerKind::FishOverlay if layer.id == self.fish_layer_id => self.overlay_source.enabled,
++            LayerKind::Image if Some(layer.id) == self.image_layer_id => self
+                 .image_overlay
+                 .as_ref()
+-                .is_some_and(|overlay| overlay.enabled);
++                .is_some_and(|overlay| overlay.enabled),
++            _ => false,
++        });
+ 
+         // Keep the original Arc-backed capture frame whenever no overlay is
+         // active. This removes one full 960x540 RGBA allocation/copy per frame.
++        //
++        // `self.layers` is stored back-to-front. Composing in vector order
++        // therefore makes the last item the visible front layer, matching the
++        // layer list UI (which displays the vector in reverse).
+         let composed_frame = if overlay_enabled {
+             let mut composed_rgba = frame.rgba.to_vec();
+-            self.overlay_source.compose_test_overlay(
+-                &mut composed_rgba,
+-                frame.width,
+-                frame.height,
+-                self.app_started_at.elapsed().as_secs_f32(),
+-            );
+-            if let Some(image_overlay) = &self.image_overlay {
+-                image_overlay.compose(&mut composed_rgba, frame.width, frame.height);
++            for layer in &self.layers {
++                match layer.kind {
++                    LayerKind::FishOverlay if layer.id == self.fish_layer_id => {
++                        self.overlay_source.compose_test_overlay(
++                            &mut composed_rgba,
++                            frame.width,
++                            frame.height,
++                            self.app_started_at.elapsed().as_secs_f32(),
++                        );
++                    }
++                    LayerKind::Image if Some(layer.id) == self.image_layer_id => {
++                        if let Some(image_overlay) = &self.image_overlay {
++                            image_overlay.compose(&mut composed_rgba, frame.width, frame.height);
++                        }
++                    }
++                    _ => {}
++                }
+             }
+             stream_capture::CaptureFrame {
+                 sequence: frame.sequence,
+@@ -1826,7 +1860,7 @@
+                     ui.add_space(8.0);
+                     ui.separator();
+                     ui.heading("レイヤー");
+-                    ui.small("上に表示される項目ほど手前。現在は選択とロックを先行実装しています。");
++                    ui.small("上に表示される項目ほど手前。順番はプレビュー・配信映像の合成順にも反映されます。");
+                     let selected_layer = self.selected_layer;
+                     let mut select_layer = None;
+                     egui::Frame::group(ui.style()).show(ui, |ui| {
+@@ -1844,6 +1878,36 @@
+                     if let Some(id) = select_layer {
+                         self.selected_layer = Some(id);
+                         self.preview_resize_drag = false;
++                    }
++
++                    let selected_index = self
++                        .selected_layer
++                        .and_then(|id| self.layers.iter().position(|layer| layer.id == id));
++                    let can_move_front = selected_index
++                        .is_some_and(|index| index + 1 < self.layers.len());
++                    let can_move_back = selected_index.is_some_and(|index| index > 0);
++                    let mut move_front = false;
++                    let mut move_back = false;
++                    ui.horizontal(|ui| {
++                        if ui
++                            .add_enabled(can_move_front, egui::Button::new("↑ 手前へ"))
++                            .clicked()
++                        {
++                            move_front = true;
++                        }
++                        if ui
++                            .add_enabled(can_move_back, egui::Button::new("↓ 奥へ"))
++                            .clicked()
++                        {
++                            move_back = true;
++                        }
++                    });
++                    if let Some(id) = self.selected_layer {
++                        if move_front {
++                            self.move_layer_toward_front(id);
++                        } else if move_back {
++                            self.move_layer_toward_back(id);
++                        }
+                     }
+ 
+                     ui.add_space(6.0);

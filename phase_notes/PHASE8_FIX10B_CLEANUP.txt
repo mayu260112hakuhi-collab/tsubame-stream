@@ -23,7 +23,7 @@ Changes:
 Run:
 cargo test --workspace
 cargo check --workspace
-cargo run -p yaoyorozu-stream
+cargo run -p tsubame
 
 Expected:
 - preview_policy tests all pass

@@ -28,7 +28,7 @@ Windows要件
 確認コマンド
 cargo test --workspace
 cargo check --workspace
-cargo run -p yaoyorozu-stream
+cargo run -p tsubame
 
 実機確認
 - Discordを起動して通話または音声再生状態にする

@@ -32,4 +32,4 @@ YouTube配信実装時はMixerControlをリアルタイムに参照する。
 Windows確認:
 cargo test --workspace
 cargo check --workspace
-cargo run -p yaoyorozu-stream
+cargo run -p tsubame

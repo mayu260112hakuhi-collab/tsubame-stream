@@ -38,4 +38,4 @@
 - 既存PC音声/マイク/GPU録画/AviUtl2導線を維持
 - cargo test --workspace
 - cargo check --workspace
-- cargo run -p yaoyorozu-stream
+- cargo run -p tsubame

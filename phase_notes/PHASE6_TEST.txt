@@ -18,7 +18,7 @@ recording/encoder phase so the UI never owns audio buffers.
 Run:
 cargo test --workspace
 cargo check --workspace
-cargo run -p yaoyorozu-stream
+cargo run -p tsubame
 
 Manual:
 1. Speak into the microphone -> Mic meter should move.

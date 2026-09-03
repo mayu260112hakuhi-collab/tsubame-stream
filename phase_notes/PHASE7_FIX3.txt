@@ -24,7 +24,7 @@ Validation:
 2. Do NOT add FFmpeg to PATH.
 3. cargo test --workspace
 4. cargo check --workspace
-5. cargo run -p yaoyorozu-stream
+5. cargo run -p tsubame
 6. Confirm the right panel shows the WinGet ffmpeg.exe path.
 7. Record 10 seconds.
 8. Confirm recording.mp4 is produced at the correct duration.

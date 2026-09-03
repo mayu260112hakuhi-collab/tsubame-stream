@@ -24,7 +24,7 @@ Then OPEN A NEW POWERSHELL before testing.
 Build:
 cargo test --workspace
 cargo check --workspace
-cargo run -p yaoyorozu-stream
+cargo run -p tsubame
 
 Manual:
 1. Make sure preview is visible.
