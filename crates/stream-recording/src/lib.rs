@@ -8,7 +8,8 @@ use std::{
 };
 use stream_audio::{
     ApplicationRecordingPath, AudioChannel, AudioChannelId, AudioChannelKind, AudioDeviceState,
-    AudioRecordingPaths, ChannelMixerControl, MixerControl, MixerSettings, PcmRecordingWorker,
+    AudioRecordingPaths, ChannelMixerControl, ExternalPcmRecordingPath, ExternalPcmRecordingSource,
+    MixerControl, MixerSettings, PcmRecordingWorker,
 };
 use stream_capture::{GpuRecordingConfig, GpuRecordingHandle, GpuRecordingStatus};
 use stream_core::EditManifest;
@@ -374,6 +375,12 @@ impl RecordingPaths {
         self.root
             .join(format!("application_{channel_id}_{safe_name}.wav"))
     }
+
+    pub fn external_audio(&self, channel_id: AudioChannelId, name: &str) -> PathBuf {
+        let safe_name = sanitize_track_name(name);
+        self.root
+            .join(format!("external_{channel_id}_{safe_name}.wav"))
+    }
 }
 
 fn sanitize_track_name(name: &str) -> String {
@@ -402,6 +409,13 @@ fn sanitize_track_name(name: &str) -> String {
 struct ApplicationTrack {
     channel_id: AudioChannelId,
     process_id: u32,
+    path: PathBuf,
+    start_channel: AudioChannel,
+}
+
+#[derive(Debug, Clone)]
+struct ExternalTrack {
+    channel_id: AudioChannelId,
     path: PathBuf,
     start_channel: AudioChannel,
 }
@@ -514,6 +528,7 @@ pub struct RecordingSession {
     mixer: MixerControl,
     channel_mixer: ChannelMixerControl,
     application_tracks: Vec<ApplicationTrack>,
+    external_tracks: Vec<ExternalTrack>,
 }
 impl RecordingSession {
     pub fn start(
@@ -556,6 +571,26 @@ impl RecordingSession {
         mixer: MixerControl,
         channel_mixer: ChannelMixerControl,
         audio_devices: AudioDeviceState,
+    ) -> Result<Self, RecordingError> {
+        Self::start_with_audio_routing_and_external(
+            base_dir,
+            config,
+            gpu,
+            mixer,
+            channel_mixer,
+            audio_devices,
+            Vec::new(),
+        )
+    }
+
+    pub fn start_with_audio_routing_and_external(
+        base_dir: impl AsRef<Path>,
+        config: RecordingConfig,
+        gpu: GpuRecordingHandle,
+        mixer: MixerControl,
+        channel_mixer: ChannelMixerControl,
+        audio_devices: AudioDeviceState,
+        external_sources: Vec<ExternalPcmRecordingSource>,
     ) -> Result<Self, RecordingError> {
         if config.source_width == 0
             || config.source_height == 0
@@ -600,6 +635,26 @@ impl RecordingSession {
             })
             .collect();
 
+        let mut external_tracks = Vec::new();
+        let mut external_recording_paths = Vec::new();
+        for source in external_sources {
+            let channel_id = source.channel_id();
+            let Some(channel) = channel_mixer.channel(channel_id) else {
+                continue;
+            };
+            let path = paths.external_audio(channel_id, &channel.name);
+            external_tracks.push(ExternalTrack {
+                channel_id,
+                path: path.clone(),
+                start_channel: channel,
+            });
+            external_recording_paths.push(ExternalPcmRecordingPath {
+                channel_id,
+                path,
+                source,
+            });
+        }
+
         let audio = match PcmRecordingWorker::start_with_devices(
             AudioRecordingPaths {
                 microphone: paths.microphone.clone(),
@@ -612,6 +667,7 @@ impl RecordingSession {
                         path: track.path.clone(),
                     })
                     .collect(),
+                external: external_recording_paths,
             },
             audio_devices,
         ) {
@@ -630,6 +686,7 @@ impl RecordingSession {
             mixer,
             channel_mixer,
             application_tracks,
+            external_tracks,
         })
     }
 
@@ -701,13 +758,30 @@ impl RecordingSession {
             legacy_mixer,
             &channels,
             &self.application_tracks,
+            &self.external_tracks,
         )?;
-        cleanup_unwanted_individual_wavs(&self.paths, &channels, &self.application_tracks);
+        cleanup_unwanted_individual_wavs(
+            &self.paths,
+            &channels,
+            &self.application_tracks,
+            &self.external_tracks,
+        );
         Ok(self.paths.clone())
     }
 }
 
 fn current_or_start_channel(channels: &[AudioChannel], track: &ApplicationTrack) -> AudioChannel {
+    channels
+        .iter()
+        .find(|channel| channel.id == track.channel_id)
+        .cloned()
+        .unwrap_or_else(|| track.start_channel.clone())
+}
+
+fn current_or_start_external_channel(
+    channels: &[AudioChannel],
+    track: &ExternalTrack,
+) -> AudioChannel {
     channels
         .iter()
         .find(|channel| channel.id == track.channel_id)
@@ -727,6 +801,7 @@ fn cleanup_unwanted_individual_wavs(
     paths: &RecordingPaths,
     channels: &[AudioChannel],
     application_tracks: &[ApplicationTrack],
+    external_tracks: &[ExternalTrack],
 ) {
     if let Some(channel) = channels
         .iter()
@@ -750,6 +825,12 @@ fn cleanup_unwanted_individual_wavs(
             remove_temporary_track_files(&track.path);
         }
     }
+    for track in external_tracks {
+        let channel = current_or_start_external_channel(channels, track);
+        if !channel.record_individual {
+            remove_temporary_track_files(&track.path);
+        }
+    }
 }
 
 fn mux_final_mp4_routed(
@@ -757,6 +838,7 @@ fn mux_final_mp4_routed(
     legacy_mixer: MixerSettings,
     channels: &[AudioChannel],
     application_tracks: &[ApplicationTrack],
+    external_tracks: &[ExternalTrack],
 ) -> Result<(), RecordingError> {
     let desktop = channels
         .iter()
@@ -812,6 +894,17 @@ fn mux_final_mp4_routed(
 
     for track in application_tracks {
         let channel = current_or_start_channel(channels, track);
+        tracks.push(FinalMixTrack {
+            path: track.path.clone(),
+            gain: channel.gain,
+            muted: channel.muted,
+            enabled: channel.enabled,
+            include_in_stream_mix: channel.include_in_stream_mix,
+        });
+    }
+
+    for track in external_tracks {
+        let channel = current_or_start_external_channel(channels, track);
         tracks.push(FinalMixTrack {
             path: track.path.clone(),
             gain: channel.gain,
@@ -879,4 +972,19 @@ fn mux_final_mp4_routed(
         ));
     }
     Ok(())
+}
+
+
+#[cfg(test)]
+mod phase8b_audio2_tests {
+    use super::*;
+
+    #[test]
+    fn external_audio_path_is_stable_and_distinct() {
+        let paths = RecordingPaths::for_root("recordings/test");
+        let path = paths.external_audio(101, "BGM: Theme Song");
+        let name = path.file_name().and_then(|v| v.to_str()).unwrap();
+        assert!(name.starts_with("external_101_"));
+        assert!(name.ends_with(".wav"));
+    }
 }

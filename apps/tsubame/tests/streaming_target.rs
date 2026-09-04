@@ -1,4 +1,4 @@
-use yaoyorozu_stream::streaming::{StreamingPlatform, StreamingTargetConfig};
+use tsubame_stream::streaming::{StreamingPlatform, StreamingTargetConfig};
 
 #[test]
 fn youtube_accepts_rtmp_and_rtmps() {

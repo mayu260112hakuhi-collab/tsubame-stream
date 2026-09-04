@@ -1,0 +1,3 @@
+Phase 8B-Perf.2.1
+Fixes Rust E0277 caused by iterating over &&Vec for bgm_mixer_snapshot.
+Apply apps/tsubame/src/app.rs over the Perf.2 version, or apply the patch under patches/phase08b-perf2.1/.

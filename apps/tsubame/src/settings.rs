@@ -6,7 +6,27 @@ use std::{
 
 pub const SETTINGS_FORMAT_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MixerWindowSettings {
+    #[serde(default = "default_true")]
+    pub open: bool,
+    #[serde(default)]
+    pub position: Option<[f32; 2]>,
+    #[serde(default)]
+    pub size: Option<[f32; 2]>,
+}
+
+impl Default for MixerWindowSettings {
+    fn default() -> Self {
+        Self {
+            open: true,
+            position: None,
+            size: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default = "settings_format_version")]
     pub format_version: u32,
@@ -30,6 +50,12 @@ pub struct AppSettings {
     pub output_device_id: Option<String>,
     #[serde(default = "default_true")]
     pub preview_window_open: bool,
+    #[serde(default)]
+    pub preview_window_position: Option<[f32; 2]>,
+    #[serde(default)]
+    pub preview_window_size: Option<[f32; 2]>,
+    #[serde(default)]
+    pub mixer_window: MixerWindowSettings,
 }
 
 impl Default for AppSettings {
@@ -46,6 +72,9 @@ impl Default for AppSettings {
             input_device_id: None,
             output_device_id: None,
             preview_window_open: true,
+            preview_window_position: None,
+            preview_window_size: None,
+            mixer_window: MixerWindowSettings::default(),
         }
     }
 }
@@ -70,6 +99,31 @@ fn default_platform() -> String {
 }
 fn default_bitrate() -> u32 {
     12_000
+}
+
+pub fn sanitize_window_position(position: Option<[f32; 2]>) -> Option<[f32; 2]> {
+    position.filter(|[x, y]| x.is_finite() && y.is_finite())
+}
+
+pub fn sanitize_window_size(size: Option<[f32; 2]>) -> Option<[f32; 2]> {
+    size.filter(|[w, h]| w.is_finite() && h.is_finite() && *w >= 320.0 && *h >= 240.0)
+}
+
+pub fn rects_intersect(
+    a_pos: [f32; 2],
+    a_size: [f32; 2],
+    b_pos: [f32; 2],
+    b_size: [f32; 2],
+) -> bool {
+    let a_right = a_pos[0] + a_size[0];
+    let a_bottom = a_pos[1] + a_size[1];
+    let b_right = b_pos[0] + b_size[0];
+    let b_bottom = b_pos[1] + b_size[1];
+
+    a_pos[0] < b_right
+        && a_right > b_pos[0]
+        && a_pos[1] < b_bottom
+        && a_bottom > b_pos[1]
 }
 
 pub fn settings_path() -> PathBuf {
@@ -134,6 +188,11 @@ mod tests {
         settings.streaming_server_url = "rtmps://example.invalid/live2".to_owned();
         settings.input_device_id = Some("mic-id".to_owned());
         settings.output_device_id = Some("speaker-id".to_owned());
+        settings.preview_window_position = Some([2020.0, 120.0]);
+        settings.preview_window_size = Some([960.0, 620.0]);
+        settings.mixer_window.open = false;
+        settings.mixer_window.position = Some([120.0, 80.0]);
+        settings.mixer_window.size = Some([920.0, 540.0]);
 
         let path =
             std::env::temp_dir().join(format!("tsubame-settings-test-{}.json", std::process::id()));
@@ -144,4 +203,82 @@ mod tests {
 
         assert_eq!(settings, loaded);
     }
+
+    #[test]
+    fn mixer_window_defaults_open_on_first_run() {
+        let settings = AppSettings::default();
+        assert!(settings.mixer_window.open);
+        assert_eq!(settings.mixer_window.position, None);
+        assert_eq!(settings.mixer_window.size, None);
+    }
+
+    #[test]
+    fn legacy_json_without_mixer_window_loads_with_open_default() {
+        let json = r#"{
+            "format_version": 1,
+            "first_run_complete": true,
+            "preset": "game",
+            "encoder_preference": "amf",
+            "recording_preview_mode": "fps15",
+            "streaming_platform": "youtube",
+            "streaming_server_url": "",
+            "streaming_video_bitrate_kbps": 12000,
+            "input_device_id": null,
+            "output_device_id": null,
+            "preview_window_open": true
+        }"#;
+
+        let loaded: AppSettings = serde_json::from_str(json).unwrap();
+        assert!(loaded.mixer_window.open);
+        assert_eq!(loaded.mixer_window.position, None);
+        assert_eq!(loaded.mixer_window.size, None);
+    }
+
+    #[test]
+    fn preview_window_geometry_defaults_for_legacy_settings() {
+        let json = r#"{
+            "format_version": 1,
+            "first_run_complete": true,
+            "preset": "game",
+            "encoder_preference": "amf",
+            "recording_preview_mode": "fps15",
+            "streaming_platform": "youtube",
+            "streaming_server_url": "",
+            "streaming_video_bitrate_kbps": 12000,
+            "input_device_id": null,
+            "output_device_id": null,
+            "preview_window_open": true
+        }"#;
+
+        let loaded: AppSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.preview_window_position, None);
+        assert_eq!(loaded.preview_window_size, None);
+    }
+
+    #[test]
+    fn mixer_window_geometry_rejects_invalid_values() {
+        assert_eq!(sanitize_window_position(Some([f32::NAN, 10.0])), None);
+        assert_eq!(sanitize_window_size(Some([100.0, 100.0])), None);
+        assert_eq!(
+            sanitize_window_size(Some([640.0, 480.0])),
+            Some([640.0, 480.0])
+        );
+    }
+
+    #[test]
+    fn window_rect_intersection_distinguishes_visible_and_offscreen() {
+        assert!(rects_intersect(
+            [100.0, 100.0],
+            [500.0, 400.0],
+            [0.0, 0.0],
+            [1920.0, 1080.0]
+        ));
+        assert!(!rects_intersect(
+            [2500.0, 100.0],
+            [500.0, 400.0],
+            [0.0, 0.0],
+            [1920.0, 1080.0]
+        ));
+    }
+
 }

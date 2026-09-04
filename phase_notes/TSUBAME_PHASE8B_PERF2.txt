@@ -1,0 +1,5 @@
+燕 / Tsubame Phase 8B-Perf.2
+音声ミキサー Deferred 化
+
+基準: Phase 8B-UI.2 + Phase 8B-Perf.1 適用済み
+変更: apps/tsubame/src/app.rs

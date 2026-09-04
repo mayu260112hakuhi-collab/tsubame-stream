@@ -180,7 +180,7 @@ UI設定:
 例:
 
 ```text
-2026-08-26_yaoyorozu_stream/
+2026-08-26_tsubame_stream/
 ├─ recording.mp4
 ├─ microphone.wav
 ├─ desktop.wav
@@ -246,7 +246,7 @@ AviUtl2が起動していない場合でもJSONを保存し、後からBridge側
 
 ```json
 {
-  "format": "yaoyorozu_stream_edit",
+  "format": "tsubame_stream_edit",
   "version": 1,
   "session": {
     "fps": 60,

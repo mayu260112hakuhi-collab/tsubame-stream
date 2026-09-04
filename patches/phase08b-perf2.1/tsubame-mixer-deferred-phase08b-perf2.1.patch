@@ -1,0 +1,11 @@
+--- a/apps/tsubame/src/app.rs
++++ b/apps/tsubame/src/app.rs
+@@ -1107,7 +1107,7 @@
+                             }
+                         }
+ 
+-                        for (bgm_id, bgm_name, volume_percent, muted) in &bgm_mixer_snapshot {
++                        for (bgm_id, bgm_name, volume_percent, muted) in bgm_mixer_snapshot {
+                             let bgm_strip = draw_mixer_channel_strip(
+                                 ui,
+                                 MixerStripModel {

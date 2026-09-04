@@ -1,5 +1,7 @@
-use std::path::{Path, PathBuf};
-
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 pub type LayerId = u64;
 
@@ -215,7 +217,7 @@ pub struct ImageOverlaySource {
     pub width_percent: f32,
     pub pixel_width: u32,
     pub pixel_height: u32,
-    rgba: Vec<u8>,
+    rgba: Arc<[u8]>,
 }
 
 impl ImageOverlaySource {
@@ -255,7 +257,7 @@ impl ImageOverlaySource {
             width_percent: 24.0,
             pixel_width,
             pixel_height,
-            rgba,
+            rgba: Arc::<[u8]>::from(rgba),
         })
     }
 
@@ -487,7 +489,7 @@ mod tests {
             width_percent: 50.0,
             pixel_width: 1,
             pixel_height: 1,
-            rgba: vec![255, 0, 0, 255],
+            rgba: Arc::<[u8]>::from(vec![255, 0, 0, 255]),
         };
         let mut target = vec![0u8; 4 * 4 * 4];
         source.compose(&mut target, 4, 4);
@@ -507,7 +509,7 @@ mod tests {
             width_percent: 20.0,
             pixel_width: 100,
             pixel_height: 50,
-            rgba: vec![255; 100 * 50 * 4],
+            rgba: Arc::<[u8]>::from(vec![255; 100 * 50 * 4]),
         };
         source.clamp_to_frame(1920, 1080);
         assert!(source.x_percent >= 10.0);

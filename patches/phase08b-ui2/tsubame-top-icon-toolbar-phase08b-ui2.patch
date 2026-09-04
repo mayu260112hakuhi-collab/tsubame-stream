@@ -1,0 +1,86 @@
+--- a/apps/tsubame/src/app.rs
++++ b/apps/tsubame/src/app.rs
+@@ -2360,6 +2360,10 @@
+     }
+ }
+ 
++fn toggle_window_open(open: &mut bool) {
++    *open = !*open;
++}
++
+ impl eframe::App for YaoyorozuApp {
+     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+         self.bgm_players.retain(|_, player| !player.is_finished());
+@@ -2378,8 +2382,26 @@
+             .exact_height(38.0)
+             .show(ctx, |ui| {
+                 ui.horizontal(|ui| {
+-                    if ui.button("⚙ 設定").clicked() {
+-                        self.settings_open = true;
++                    if ui
++                        .selectable_label(self.preview_window_open, "▣ プレビュー")
++                        .on_hover_text("プレビューウィンドウを開く / 閉じる")
++                        .clicked()
++                    {
++                        toggle_window_open(&mut self.preview_window_open);
++                    }
++                    if ui
++                        .selectable_label(self.mixer_window_open, "≡ ミキサー")
++                        .on_hover_text("音声ミキサーを開く / 閉じる")
++                        .clicked()
++                    {
++                        toggle_window_open(&mut self.mixer_window_open);
++                    }
++                    if ui
++                        .selectable_label(self.settings_open, "⚙ 設定")
++                        .on_hover_text("設定ウィンドウを開く / 閉じる")
++                        .clicked()
++                    {
++                        toggle_window_open(&mut self.settings_open);
+                     }
+                     ui.separator();
+                     ui.strong("燕 / Tsubame");
+@@ -2603,10 +2625,6 @@
+                             .show(ui, |ui| {
+                     ui.horizontal_wrapped(|ui| {
+                         ui.heading("プレビュー");
+-                        let button_label = if self.preview_window_open { "閉じる" } else { "開く" };
+-                        if ui.button(button_label).clicked() {
+-                            self.preview_window_open = !self.preview_window_open;
+-                        }
+                         ui.small(format!("{}×{}", self.preview_size[0], self.preview_size[1]));
+                     });
+                     ui.small(if self.preview_window_open {
+@@ -3003,14 +3021,6 @@
+                     },
+                 );
+ 
+-                ui.separator();
+-
+-                ui.group(|ui| {
+-                    ui.label("音声");
+-                    if ui.button("音声ミキサーを開く").clicked() {
+-                        self.mixer_window_open = true;
+-                    }
+-                });
+             });
+         });
+ 
+@@ -3038,3 +3048,17 @@
+         ctx.request_repaint_after(std::time::Duration::from_millis(repaint_ms));
+     }
+ }
++
++#[cfg(test)]
++mod toolbar_tests {
++    use super::toggle_window_open;
++
++    #[test]
++    fn toolbar_toggle_flips_auxiliary_window_state_both_ways() {
++        let mut open = false;
++        toggle_window_open(&mut open);
++        assert!(open);
++        toggle_window_open(&mut open);
++        assert!(!open);
++    }
++}

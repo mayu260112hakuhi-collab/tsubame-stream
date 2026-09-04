@@ -1,4 +1,4 @@
-use yaoyorozu_stream::app::fit_aspect;
+use tsubame_stream::app::fit_aspect;
 
 #[test]
 fn preview_fit_preserves_16_by_9_inside_square() {

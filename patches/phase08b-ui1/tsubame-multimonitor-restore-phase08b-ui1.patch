@@ -1,0 +1,240 @@
+--- a/apps/tsubame/src/app.rs
++++ b/apps/tsubame/src/app.rs
+@@ -2,8 +2,7 @@
+ use crate::bgm::{BgmLayerSource, BgmPlayer};
+ use crate::scene::{ImageOverlaySource, LayerId, LayerKind, OverlaySource, SceneLayer};
+ use crate::settings::{
+-    load_settings, rects_intersect, sanitize_window_position, sanitize_window_size, save_settings,
+-    AppSettings,
++    load_settings, sanitize_window_position, sanitize_window_size, save_settings, AppSettings,
+ };
+ use crate::streaming::{StreamingPlatform, StreamingSession, StreamingTargetConfig};
+ use crate::ui_layout::{
+@@ -439,29 +438,6 @@
+     files
+ }
+ 
+-fn mixer_rect_is_visible_on_monitor(outer_rect: egui::Rect, monitor_size: egui::Vec2) -> bool {
+-    if monitor_size.x <= 1.0 || monitor_size.y <= 1.0 {
+-        return true;
+-    }
+-    if !rects_intersect(
+-        [outer_rect.min.x, outer_rect.min.y],
+-        [outer_rect.width(), outer_rect.height()],
+-        [0.0, 0.0],
+-        [monitor_size.x, monitor_size.y],
+-    ) {
+-        return false;
+-    }
+-
+-    let visible_left = outer_rect.min.x.max(0.0);
+-    let visible_top = outer_rect.min.y.max(0.0);
+-    let visible_right = outer_rect.max.x.min(monitor_size.x);
+-    let visible_bottom = outer_rect.max.y.min(monitor_size.y);
+-    let visible_width = (visible_right - visible_left).max(0.0);
+-    let visible_height = (visible_bottom - visible_top).max(0.0);
+-
+-    // Keep enough of the window visible to find and drag it, not merely one pixel.
+-    visible_width >= 80.0 && visible_height >= 32.0
+-}
+ 
+ pub struct YaoyorozuApp {
+     vm: StreamViewModel,
+@@ -476,6 +452,8 @@
+     preview_texture: Option<egui::TextureHandle>,
+     preview_size: [u32; 2],
+     preview_window_open: bool,
++    preview_window_position: Option<[f32; 2]>,
++    preview_window_size: Option<[f32; 2]>,
+     mixer_window_open: bool,
+     mixer_window_position: Option<[f32; 2]>,
+     mixer_window_size: Option<[f32; 2]>,
+@@ -780,6 +758,10 @@
+             preview_texture: None,
+             preview_size: [0, 0],
+             preview_window_open: persisted_settings.preview_window_open,
++            preview_window_position: sanitize_window_position(
++                persisted_settings.preview_window_position,
++            ),
++            preview_window_size: sanitize_window_size(persisted_settings.preview_window_size),
+             mixer_window_open: persisted_settings.mixer_window.open,
+             mixer_window_position: sanitize_window_position(
+                 persisted_settings.mixer_window.position,
+@@ -863,6 +845,9 @@
+         settings.streaming_server_url = self.streaming_target.server_url.clone();
+         settings.streaming_video_bitrate_kbps = self.streaming_target.video_bitrate_kbps;
+         settings.preview_window_open = self.preview_window_open;
++        settings.preview_window_position =
++            sanitize_window_position(self.preview_window_position);
++        settings.preview_window_size = sanitize_window_size(self.preview_window_size);
+         settings.mixer_window.open = self.mixer_window_open;
+         settings.mixer_window.position = sanitize_window_position(self.mixer_window_position);
+         settings.mixer_window.size = sanitize_window_size(self.mixer_window_size);
+@@ -2129,44 +2114,23 @@
+                 close_requested = true;
+             }
+ 
+-            let mut rescued_offscreen = false;
+-            if let (Some(outer_rect), Some(monitor_size)) =
+-                (viewport_info.outer_rect, viewport_info.monitor_size)
+-            {
+-                if !mixer_rect_is_visible_on_monitor(outer_rect, monitor_size) {
+-                    let width = outer_rect.width().min(monitor_size.x.max(320.0));
+-                    let height = outer_rect.height().min(monitor_size.y.max(240.0));
+-                    let x = ((monitor_size.x - width) * 0.5).max(0.0);
+-                    let y = ((monitor_size.y - height) * 0.5).max(0.0);
+-                    self.mixer_window_position = None;
+-                    self.mixer_window_size = sanitize_window_size(Some([width, height]));
+-                    mixer_ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(
+-                        egui::pos2(x, y),
+-                    ));
+-                    if let Some(size) = self.mixer_window_size {
+-                        mixer_ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+-                            egui::vec2(size[0], size[1]),
+-                        ));
+-                    }
+-                    rescued_offscreen = true;
+-                }
+-            }
+-
+-            if !rescued_offscreen {
+-                if let Some(outer_rect) = viewport_info.outer_rect {
+-                    self.mixer_window_position = sanitize_window_position(Some([
+-                        outer_rect.min.x,
+-                        outer_rect.min.y,
+-                    ]));
+-                }
+-                if let Some(inner_rect) = viewport_info.inner_rect {
+-                    let mut size = [inner_rect.width(), inner_rect.height()];
+-                    if let Some(monitor_size) = viewport_info.monitor_size {
+-                        size[0] = size[0].min(monitor_size.x.max(320.0));
+-                        size[1] = size[1].min(monitor_size.y.max(240.0));
+-                    }
+-                    self.mixer_window_size = sanitize_window_size(Some(size));
+-                }
++            // Do not clamp against monitor_size while the window is alive.
++            // outer_rect is in desktop coordinates, while monitor_size is only
++            // the current monitor's size. Comparing them directly breaks
++            // secondary-monitor placement. Let Windows resolve unavailable
++            // monitor coordinates when the viewport is created, then persist
++            // the actual OS-resolved geometry reported here.
++            if let Some(outer_rect) = viewport_info.outer_rect {
++                self.mixer_window_position = sanitize_window_position(Some([
++                    outer_rect.min.x,
++                    outer_rect.min.y,
++                ]));
++            }
++            if let Some(inner_rect) = viewport_info.inner_rect {
++                self.mixer_window_size = sanitize_window_size(Some([
++                    inner_rect.width(),
++                    inner_rect.height(),
++                ]));
+             }
+ 
+             egui::CentralPanel::default().show(mixer_ctx, |ui| {
+@@ -2193,19 +2157,42 @@
+             return;
+         }
+ 
++        self.preview_window_position = sanitize_window_position(self.preview_window_position);
++        self.preview_window_size = sanitize_window_size(self.preview_window_size);
++
+         let [default_w, default_h] = normal_preview_size();
+         let viewport_id = egui::ViewportId::from_hash_of("yaoyorozu_preview_window");
+-        let builder = egui::ViewportBuilder::default()
++        let mut builder = egui::ViewportBuilder::default()
+             .with_title("燕 / Tsubame Preview")
+-            .with_inner_size([default_w + 40.0, default_h + 80.0])
++            .with_inner_size(
++                self.preview_window_size
++                    .unwrap_or([default_w + 40.0, default_h + 80.0]),
++            )
+             .with_min_inner_size([360.0, 240.0]);
+-        let mut close_requested = false;
++        if let Some([x, y]) = self.preview_window_position {
++            builder = builder.with_position([x, y]);
++        }
+ 
++        let mut close_requested = false;
+         ctx.show_viewport_immediate(viewport_id, builder, |preview_ctx, _class| {
+-            if preview_ctx.input(|i| i.viewport().close_requested()) {
++            let viewport_info = preview_ctx.input(|input| input.viewport().clone());
++            if viewport_info.close_requested() {
+                 close_requested = true;
+             }
+ 
++            if let Some(outer_rect) = viewport_info.outer_rect {
++                self.preview_window_position = sanitize_window_position(Some([
++                    outer_rect.min.x,
++                    outer_rect.min.y,
++                ]));
++            }
++            if let Some(inner_rect) = viewport_info.inner_rect {
++                self.preview_window_size = sanitize_window_size(Some([
++                    inner_rect.width(),
++                    inner_rect.height(),
++                ]));
++            }
++
+             egui::CentralPanel::default().show(preview_ctx, |ui| {
+                 ui.horizontal(|ui| {
+                     ui.heading("プレビュー");
+--- a/apps/tsubame/src/settings.rs
++++ b/apps/tsubame/src/settings.rs
+@@ -51,6 +51,10 @@
+     #[serde(default = "default_true")]
+     pub preview_window_open: bool,
+     #[serde(default)]
++    pub preview_window_position: Option<[f32; 2]>,
++    #[serde(default)]
++    pub preview_window_size: Option<[f32; 2]>,
++    #[serde(default)]
+     pub mixer_window: MixerWindowSettings,
+ }
+ 
+@@ -68,6 +72,8 @@
+             input_device_id: None,
+             output_device_id: None,
+             preview_window_open: true,
++            preview_window_position: None,
++            preview_window_size: None,
+             mixer_window: MixerWindowSettings::default(),
+         }
+     }
+@@ -182,6 +188,8 @@
+         settings.streaming_server_url = "rtmps://example.invalid/live2".to_owned();
+         settings.input_device_id = Some("mic-id".to_owned());
+         settings.output_device_id = Some("speaker-id".to_owned());
++        settings.preview_window_position = Some([2020.0, 120.0]);
++        settings.preview_window_size = Some([960.0, 620.0]);
+         settings.mixer_window.open = false;
+         settings.mixer_window.position = Some([120.0, 80.0]);
+         settings.mixer_window.size = Some([920.0, 540.0]);
+@@ -227,6 +235,27 @@
+     }
+ 
+     #[test]
++    fn preview_window_geometry_defaults_for_legacy_settings() {
++        let json = r#"{
++            "format_version": 1,
++            "first_run_complete": true,
++            "preset": "game",
++            "encoder_preference": "amf",
++            "recording_preview_mode": "fps15",
++            "streaming_platform": "youtube",
++            "streaming_server_url": "",
++            "streaming_video_bitrate_kbps": 12000,
++            "input_device_id": null,
++            "output_device_id": null,
++            "preview_window_open": true
++        }"#;
++
++        let loaded: AppSettings = serde_json::from_str(json).unwrap();
++        assert_eq!(loaded.preview_window_position, None);
++        assert_eq!(loaded.preview_window_size, None);
++    }
++
++    #[test]
+     fn mixer_window_geometry_rejects_invalid_values() {
+         assert_eq!(sanitize_window_position(Some([f32::NAN, 10.0])), None);
+         assert_eq!(sanitize_window_size(Some([100.0, 100.0])), None);

@@ -1,0 +1,296 @@
+--- a/apps/tsubame/src/app.rs
++++ b/apps/tsubame/src/app.rs
+@@ -300,6 +300,7 @@
+ struct RuntimeFrameCountSnapshot {
+     preview_ui_frames: u64,
+     mixer_ui_frames: u64,
++    mixer_meter_updates: u64,
+     streaming_output_frames: u64,
+ }
+ 
+@@ -307,6 +308,7 @@
+ struct RuntimeFrameCounters {
+     preview_ui_frames: AtomicU64,
+     mixer_ui_frames: AtomicU64,
++    mixer_meter_updates: AtomicU64,
+     streaming_output_frames: AtomicU64,
+ }
+ 
+@@ -315,6 +317,7 @@
+         RuntimeFrameCountSnapshot {
+             preview_ui_frames: self.preview_ui_frames.load(Ordering::Relaxed),
+             mixer_ui_frames: self.mixer_ui_frames.load(Ordering::Relaxed),
++            mixer_meter_updates: self.mixer_meter_updates.load(Ordering::Relaxed),
+             streaming_output_frames: self.streaming_output_frames.load(Ordering::Relaxed),
+         }
+     }
+@@ -327,6 +330,10 @@
+         self.mixer_ui_frames.fetch_add(1, Ordering::Relaxed);
+     }
+ 
++    fn count_mixer_meter_update(&self) {
++        self.mixer_meter_updates.fetch_add(1, Ordering::Relaxed);
++    }
++
+     fn count_streaming_output_frame(&self) {
+         self.streaming_output_frames.fetch_add(1, Ordering::Relaxed);
+     }
+@@ -340,6 +347,27 @@
+     current.saturating_sub(previous) as f32 / seconds
+ }
+ 
++fn mixer_meter_refresh_due(last_refresh: Option<Instant>, now: Instant) -> bool {
++    last_refresh
++        .map(|last| now.saturating_duration_since(last) >= Duration::from_millis(33))
++        .unwrap_or(true)
++}
++
++fn performance_pipeline_text(
++    capture_fps: f32,
++    preview_fps: f32,
++    mixer_render_fps: f32,
++    mixer_meter_fps: f32,
++    encode_input_fps: f32,
++    target_fps: u32,
++    drops: u64,
++) -> String {
++    format!(
++        "Capture {:.1} FPS | Preview {:.1} FPS | Mixer Render {:.1} FPS | Meter {:.1} FPS | Encode In {:.1} FPS | Target {} FPS | Drop {}",
++        capture_fps, preview_fps, mixer_render_fps, mixer_meter_fps, encode_input_fps, target_fps, drops
++    )
++}
++
+ #[derive(Debug)]
+ struct PerformanceMonitor {
+     system: System,
+@@ -349,7 +377,8 @@
+     memory_mb: f64,
+     preview_fps: f32,
+     mixer_ui_fps: f32,
+-    output_fps: f32,
++    mixer_meter_fps: f32,
++    encode_input_fps: f32,
+     last_runtime_counts: RuntimeFrameCountSnapshot,
+     last_recording_encoded_frames: Option<u64>,
+ }
+@@ -364,7 +393,8 @@
+             memory_mb: 0.0,
+             preview_fps: 0.0,
+             mixer_ui_fps: 0.0,
+-            output_fps: 0.0,
++            mixer_meter_fps: 0.0,
++            encode_input_fps: 0.0,
+             last_runtime_counts: RuntimeFrameCountSnapshot::default(),
+             last_recording_encoded_frames: None,
+         }
+@@ -392,13 +422,18 @@
+             self.last_runtime_counts.mixer_ui_frames,
+             elapsed,
+         );
++        self.mixer_meter_fps = measured_fps(
++            current_counts.mixer_meter_updates,
++            self.last_runtime_counts.mixer_meter_updates,
++            elapsed,
++        );
+ 
+         let streaming_output_fps = measured_fps(
+             current_counts.streaming_output_frames,
+             self.last_runtime_counts.streaming_output_frames,
+             elapsed,
+         );
+-        self.output_fps = if streaming_active {
++        self.encode_input_fps = if streaming_active {
+             streaming_output_fps
+         } else if let Some(current_recording_frames) = recording_encoded_frames {
+             self.last_recording_encoded_frames
+@@ -613,11 +648,21 @@
+     },
+ }
+ 
++#[derive(Debug, Clone, Default)]
++struct MixerMeterSnapshot {
++    desktop: f32,
++    mic: f32,
++    mix: f32,
++    application_levels: HashMap<u64, f32>,
++}
++
+ #[derive(Debug, Clone)]
+ struct DeferredMixerUiState {
+     selected_application_audio_pid: Option<u32>,
+     application_audio_message: String,
+     audio_message: String,
++    meter_snapshot: MixerMeterSnapshot,
++    last_meter_refresh: Option<Instant>,
+     last_window_position: Option<[f32; 2]>,
+     last_window_size: Option<[f32; 2]>,
+ }
+@@ -628,6 +673,8 @@
+             selected_application_audio_pid: None,
+             application_audio_message: "アプリ音声: 一覧から選択してください".to_owned(),
+             audio_message: "WASAPI音声メーター: 初期化中".to_owned(),
++            meter_snapshot: MixerMeterSnapshot::default(),
++            last_meter_refresh: None,
+             last_window_position: None,
+             last_window_size: None,
+         }
+@@ -1068,11 +1115,14 @@
+     mixer_ctx: &egui::Context,
+     ui: &mut egui::Ui,
+     audio: Option<&Arc<AudioWorker>>,
++    meter_snapshot: &MixerMeterSnapshot,
+     snapshot: &MixerRenderSnapshot,
+     ui_state: &Arc<Mutex<DeferredMixerUiState>>,
+     command_tx: &mpsc::Sender<MixerViewportCommand>,
+ ) {
+-    let levels = audio.map(|audio| audio.levels()).unwrap_or_default();
++    let desktop_level = meter_snapshot.desktop;
++    let mic_level = meter_snapshot.mic;
++    let mix_level = meter_snapshot.mix;
+     // BGM PCMはまだPhase 8B-Audio前なので実メーターは0.0のまま。
+     // UI状態は親からの軽量スナップショットで受け、操作はコマンドで返す。
+     let bgm_mixer_snapshot = &snapshot.bgm_rows;
+@@ -1135,7 +1185,7 @@
+                             MixerStripModel {
+                                 title: "PC音声".to_owned(),
+                                 source: desktop_source_label,
+-                                level: levels.desktop,
++                                level: desktop_level,
+                                 gain_percent: settings.desktop_gain * 100.0,
+                                 mute: Some(settings.desktop_muted),
+                                 mix: desktop_channel.as_ref().map(|c| c.include_in_stream_mix),
+@@ -1169,7 +1219,7 @@
+                             MixerStripModel {
+                                 title: "マイク".to_owned(),
+                                 source: microphone_source_label,
+-                                level: levels.mic,
++                                level: mic_level,
+                                 gain_percent: settings.mic_gain * 100.0,
+                                 mute: Some(settings.mic_muted),
+                                 mix: microphone_channel.as_ref().map(|c| c.include_in_stream_mix),
+@@ -1237,7 +1287,11 @@
+                                 MixerStripModel {
+                                     title: channel.name.clone(),
+                                     source,
+-                                    level: channel.current_level,
++                                    level: meter_snapshot
++                                        .application_levels
++                                        .get(&channel.id)
++                                        .copied()
++                                        .unwrap_or(0.0),
+                                     gain_percent: channel.gain * 100.0,
+                                     mute: Some(channel.muted),
+                                     mix: Some(channel.include_in_stream_mix),
+@@ -1273,7 +1327,7 @@
+                             MixerStripModel {
+                                 title: "Master".to_owned(),
+                                 source: "配信Mix".to_owned(),
+-                                level: levels.mix,
++                                level: mix_level,
+                                 gain_percent: settings.master_gain * 100.0,
+                                 mute: None,
+                                 mix: None,
+@@ -2693,6 +2747,29 @@
+             }
+ 
+             let snapshot_value = snapshot.read().map(|value| value.clone()).unwrap_or_default();
++            let now = Instant::now();
++            let meter_snapshot = if let Ok(mut state) = ui_state.lock() {
++                if mixer_meter_refresh_due(state.last_meter_refresh, now) {
++                    if let Some(audio) = audio.as_ref() {
++                        let levels = audio.levels();
++                        state.meter_snapshot.desktop = levels.desktop;
++                        state.meter_snapshot.mic = levels.mic;
++                        state.meter_snapshot.mix = levels.mix;
++                        state.meter_snapshot.application_levels = audio
++                            .audio_channels()
++                            .into_iter()
++                            .map(|channel| (channel.id, channel.current_level))
++                            .collect();
++                    } else {
++                        state.meter_snapshot = MixerMeterSnapshot::default();
++                    }
++                    state.last_meter_refresh = Some(now);
++                    runtime_frame_counters.count_mixer_meter_update();
++                }
++                state.meter_snapshot.clone()
++            } else {
++                MixerMeterSnapshot::default()
++            };
+ 
+             egui::CentralPanel::default().show(mixer_ctx, |ui| {
+                 ui.horizontal(|ui| {
+@@ -2708,6 +2785,7 @@
+                     mixer_ctx,
+                     ui,
+                     audio.as_ref(),
++                    &meter_snapshot,
+                     &snapshot_value,
+                     &ui_state,
+                     &command_tx,
+@@ -3080,14 +3158,18 @@
+                     })
+                     .unwrap_or((0.0, 0));
+                 ui.label(format!(
+-                    "CPU {:.1}% | RAM {:.0} MB | Capture {:.1} FPS | Preview {:.1} FPS | Mixer UI {:.1} FPS | Output {:.1} FPS | Drop {}",
++                    "CPU {:.1}% | RAM {:.0} MB | {}",
+                     self.performance.cpu_percent,
+                     self.performance.memory_mb,
+-                    capture_fps,
+-                    self.performance.preview_fps,
+-                    self.performance.mixer_ui_fps,
+-                    self.performance.output_fps,
+-                    preview_drops
++                    performance_pipeline_text(
++                        capture_fps,
++                        self.performance.preview_fps,
++                        self.performance.mixer_ui_fps,
++                        self.performance.mixer_meter_fps,
++                        self.performance.encode_input_fps,
++                        self.capture_target_fps,
++                        preview_drops,
++                    )
+                 ));
+                 ui.separator();
+                 ui.label(self.streaming_target.connection_label());
+@@ -3710,6 +3792,24 @@
+     }
+ 
+     #[test]
++    fn mixer_meter_refresh_is_capped_at_about_30hz() {
++        let start = Instant::now();
++        assert!(mixer_meter_refresh_due(None, start));
++        assert!(!mixer_meter_refresh_due(Some(start), start + Duration::from_millis(20)));
++        assert!(mixer_meter_refresh_due(Some(start), start + Duration::from_millis(34)));
++    }
++
++    #[test]
++    fn performance_labels_distinguish_encode_input_from_target_fps() {
++        let text = performance_pipeline_text(24.2, 0.0, 58.1, 29.7, 23.6, 60, 0);
++        assert!(text.contains("Capture 24.2 FPS"));
++        assert!(text.contains("Mixer Render 58.1 FPS"));
++        assert!(text.contains("Meter 29.7 FPS"));
++        assert!(text.contains("Encode In 23.6 FPS"));
++        assert!(text.contains("Target 60 FPS"));
++    }
++
++    #[test]
+     fn measured_fps_uses_actual_elapsed_time() {
+         let fps = measured_fps(45, 15, Duration::from_millis(1500));
+         assert!((fps - 20.0).abs() < 0.001);
+@@ -3721,6 +3821,7 @@
+         counters.count_preview_ui_frame();
+         counters.count_preview_ui_frame();
+         counters.count_mixer_ui_frame();
++        counters.count_mixer_meter_update();
+         counters.count_streaming_output_frame();
+         counters.count_streaming_output_frame();
+         counters.count_streaming_output_frame();
+@@ -3728,6 +3829,7 @@
+         let snapshot = counters.snapshot();
+         assert_eq!(snapshot.preview_ui_frames, 2);
+         assert_eq!(snapshot.mixer_ui_frames, 1);
++        assert_eq!(snapshot.mixer_meter_updates, 1);
+         assert_eq!(snapshot.streaming_output_frames, 3);
+     }
+ 

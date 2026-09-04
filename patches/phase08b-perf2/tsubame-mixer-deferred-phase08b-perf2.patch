@@ -1,0 +1,1228 @@
+--- a/apps/tsubame/src/app.rs
++++ b/apps/tsubame/src/app.rs
+@@ -495,6 +495,72 @@
+     last_window_size: Option<[f32; 2]>,
+ }
+ 
++#[derive(Debug, Clone, Default)]
++struct MixerRenderSnapshot {
++    bgm_rows: Vec<(LayerId, String, f32, bool)>,
++    device_switch_enabled: bool,
++    device_switch_reason: Option<String>,
++}
++
++#[derive(Debug)]
++enum MixerViewportCommand {
++    Close,
++    Geometry {
++        position: Option<[f32; 2]>,
++        size: Option<[f32; 2]>,
++    },
++    BgmGain {
++        layer_id: LayerId,
++        gain_percent: f32,
++    },
++    BgmMute {
++        layer_id: LayerId,
++        muted: bool,
++    },
++    RemoveBgm {
++        layer_id: LayerId,
++    },
++}
++
++#[derive(Debug, Clone)]
++struct DeferredMixerUiState {
++    selected_application_audio_pid: Option<u32>,
++    application_audio_message: String,
++    audio_message: String,
++    last_window_position: Option<[f32; 2]>,
++    last_window_size: Option<[f32; 2]>,
++}
++
++impl Default for DeferredMixerUiState {
++    fn default() -> Self {
++        Self {
++            selected_application_audio_pid: None,
++            application_audio_message: "アプリ音声: 一覧から選択してください".to_owned(),
++            audio_message: "WASAPI音声メーター: 初期化中".to_owned(),
++            last_window_position: None,
++            last_window_size: None,
++        }
++    }
++}
++
++fn mixer_ui_repaint_ms(open: bool) -> u64 {
++    if open {
++        33
++    } else {
++        250
++    }
++}
++
++fn send_mixer_command(
++    ctx: &egui::Context,
++    tx: &mpsc::Sender<MixerViewportCommand>,
++    command: MixerViewportCommand,
++) {
++    if tx.send(command).is_ok() {
++        ctx.request_repaint_of(egui::ViewportId::ROOT);
++    }
++}
++
+ fn main_ui_repaint_ms(
+     streaming: bool,
+     _preview_open: bool,
+@@ -907,6 +973,418 @@
+ }
+ 
+ 
++fn draw_deferred_audio_mixer(
++    mixer_ctx: &egui::Context,
++    ui: &mut egui::Ui,
++    audio: Option<&Arc<AudioWorker>>,
++    snapshot: &MixerRenderSnapshot,
++    ui_state: &Arc<Mutex<DeferredMixerUiState>>,
++    command_tx: &mpsc::Sender<MixerViewportCommand>,
++) {
++    let levels = audio.map(|audio| audio.levels()).unwrap_or_default();
++    // BGM PCMはまだPhase 8B-Audio前なので実メーターは0.0のまま。
++    // UI状態は親からの軽量スナップショットで受け、操作はコマンドで返す。
++    let bgm_mixer_snapshot = &snapshot.bgm_rows;
++    let mut bgm_mixer_gain_changes: Vec<(LayerId, f32)> = Vec::new();
++    let mut bgm_mixer_mute_changes: Vec<(LayerId, bool)> = Vec::new();
++    let mut bgm_mixer_remove: Option<LayerId> = None;
++
++    if let Some(audio) = audio {
++            let settings = audio.mixer_settings();
++            let output_devices = audio.output_devices();
++            let input_devices = audio.input_devices();
++            let device_switch_enabled = snapshot.device_switch_enabled;
++            let all_channels = audio.audio_channels();
++            let desktop_channel = all_channels
++                .iter()
++                .find(|channel| channel.id == ChannelMixerControl::DESKTOP_ID)
++                .cloned();
++            let microphone_channel = all_channels
++                .iter()
++                .find(|channel| channel.id == ChannelMixerControl::MICROPHONE_ID)
++                .cloned();
++            let application_channels: Vec<_> = all_channels
++                .into_iter()
++                .filter(|channel| channel.kind == AudioChannelKind::Application)
++                .collect();
++
++            // Mixer stripには長いWASAPIステータス文字列をそのまま出さない。
++            // Windows既定を使っている場合は短い「Win規定」に統一して、
++            // PC音声 / マイク / Master の3段目の高さを揃える。
++            let selected_output = audio.selected_output_device();
++            let desktop_source_label = match &selected_output {
++                AudioDeviceSelection::Default => "Win規定".to_owned(),
++                AudioDeviceSelection::DeviceId(_) => compact_source_name(
++                    &selection_label(&selected_output, &output_devices),
++                    10,
++                ),
++            };
++            let selected_input = audio.selected_input_device();
++            let microphone_source_label = match &selected_input {
++                AudioDeviceSelection::Default => "Win規定".to_owned(),
++                AudioDeviceSelection::DeviceId(_) => compact_source_name(
++                    &selection_label(&selected_input, &input_devices),
++                    10,
++                ),
++            };
++
++            ui.small("同一サイズのチャンネルストリップ / PC・マイク・BGM・アプリ音声・Masterを同じ基準で表示します");
++            ui.add_space(4.0);
++
++            let mut remove_channel = None;
++            egui::ScrollArea::horizontal()
++                .id_salt("vertical_audio_mixer_channels")
++                .auto_shrink([false, true])
++                .show(ui, |ui| {
++                    ui.horizontal_top(|ui| {
++                        ui.spacing_mut().item_spacing.x = 4.0;
++
++                        let desktop_strip = draw_mixer_channel_strip(
++                            ui,
++                            MixerStripModel {
++                                title: "PC音声".to_owned(),
++                                source: desktop_source_label,
++                                level: levels.desktop,
++                                gain_percent: settings.desktop_gain * 100.0,
++                                mute: Some(settings.desktop_muted),
++                                mix: desktop_channel.as_ref().map(|c| c.include_in_stream_mix),
++                                wav: desktop_channel.as_ref().map(|c| c.record_individual),
++                                removable: false,
++                            },
++                        );
++                        if desktop_strip.gain_changed {
++                            audio.set_desktop_gain(desktop_strip.gain_percent / 100.0);
++                        }
++                        if desktop_strip.mute != Some(settings.desktop_muted) {
++                            if let Some(muted) = desktop_strip.mute {
++                                audio.set_desktop_muted(muted);
++                            }
++                        }
++                        if let Some(channel) = &desktop_channel {
++                            if desktop_strip.mix != Some(channel.include_in_stream_mix) {
++                                if let Some(in_mix) = desktop_strip.mix {
++                                    audio.set_channel_include_in_stream_mix(channel.id, in_mix);
++                                }
++                            }
++                            if desktop_strip.wav != Some(channel.record_individual) {
++                                if let Some(record) = desktop_strip.wav {
++                                    audio.set_channel_record_individual(channel.id, record);
++                                }
++                            }
++                        }
++
++                        let microphone_strip = draw_mixer_channel_strip(
++                            ui,
++                            MixerStripModel {
++                                title: "マイク".to_owned(),
++                                source: microphone_source_label,
++                                level: levels.mic,
++                                gain_percent: settings.mic_gain * 100.0,
++                                mute: Some(settings.mic_muted),
++                                mix: microphone_channel.as_ref().map(|c| c.include_in_stream_mix),
++                                wav: microphone_channel.as_ref().map(|c| c.record_individual),
++                                removable: false,
++                            },
++                        );
++                        if microphone_strip.gain_changed {
++                            audio.set_mic_gain(microphone_strip.gain_percent / 100.0);
++                        }
++                        if microphone_strip.mute != Some(settings.mic_muted) {
++                            if let Some(muted) = microphone_strip.mute {
++                                audio.set_mic_muted(muted);
++                            }
++                        }
++                        if let Some(channel) = &microphone_channel {
++                            if microphone_strip.mix != Some(channel.include_in_stream_mix) {
++                                if let Some(in_mix) = microphone_strip.mix {
++                                    audio.set_channel_include_in_stream_mix(channel.id, in_mix);
++                                }
++                            }
++                            if microphone_strip.wav != Some(channel.record_individual) {
++                                if let Some(record) = microphone_strip.wav {
++                                    audio.set_channel_record_individual(channel.id, record);
++                                }
++                            }
++                        }
++
++                        for (bgm_id, bgm_name, volume_percent, muted) in &bgm_mixer_snapshot {
++                            let bgm_strip = draw_mixer_channel_strip(
++                                ui,
++                                MixerStripModel {
++                                    title: "BGM".to_owned(),
++                                    source: bgm_name.clone(),
++                                    // Phase 8AではPCMメーターはまだstream-audio未統合。
++                                    // ストリップ構造を先に統一し、実レベルは8Bで接続する。
++                                    level: 0.0,
++                                    gain_percent: *volume_percent,
++                                    mute: Some(*muted),
++                                    mix: None,
++                                    wav: None,
++                                    removable: true,
++                                },
++                            );
++                            if bgm_strip.gain_changed {
++                                bgm_mixer_gain_changes.push((*bgm_id, bgm_strip.gain_percent));
++                            }
++                            if bgm_strip.mute != Some(*muted) {
++                                if let Some(new_muted) = bgm_strip.mute {
++                                    bgm_mixer_mute_changes.push((*bgm_id, new_muted));
++                                }
++                            }
++                            if bgm_strip.remove_clicked {
++                                bgm_mixer_remove = Some(*bgm_id);
++                            }
++                        }
++
++                        for channel in &application_channels {
++                            let source = channel
++                                .process_id
++                                .map(|pid| format!("PID {pid}"))
++                                .unwrap_or_else(|| "アプリ音声".to_owned());
++                            let app_strip = draw_mixer_channel_strip(
++                                ui,
++                                MixerStripModel {
++                                    title: channel.name.clone(),
++                                    source,
++                                    level: channel.current_level,
++                                    gain_percent: channel.gain * 100.0,
++                                    mute: Some(channel.muted),
++                                    mix: Some(channel.include_in_stream_mix),
++                                    wav: Some(channel.record_individual),
++                                    removable: true,
++                                },
++                            );
++                            if app_strip.gain_changed {
++                                audio.set_channel_gain(channel.id, app_strip.gain_percent / 100.0);
++                            }
++                            if app_strip.mute != Some(channel.muted) {
++                                if let Some(muted) = app_strip.mute {
++                                    audio.set_channel_muted(channel.id, muted);
++                                }
++                            }
++                            if app_strip.mix != Some(channel.include_in_stream_mix) {
++                                if let Some(in_mix) = app_strip.mix {
++                                    audio.set_channel_include_in_stream_mix(channel.id, in_mix);
++                                }
++                            }
++                            if app_strip.wav != Some(channel.record_individual) {
++                                if let Some(record) = app_strip.wav {
++                                    audio.set_channel_record_individual(channel.id, record);
++                                }
++                            }
++                            if app_strip.remove_clicked {
++                                remove_channel = Some(channel.id);
++                            }
++                        }
++
++                        let master_strip = draw_mixer_channel_strip(
++                            ui,
++                            MixerStripModel {
++                                title: "Master".to_owned(),
++                                source: "配信Mix".to_owned(),
++                                level: levels.mix,
++                                gain_percent: settings.master_gain * 100.0,
++                                mute: None,
++                                mix: None,
++                                wav: None,
++                                removable: false,
++                            },
++                        );
++                        if master_strip.gain_changed {
++                            audio.set_master_gain(master_strip.gain_percent / 100.0);
++                        }
++                    });
++                });
++
++            if let Some(id) = remove_channel {
++                audio.remove_audio_channel(id);
++            }
++
++            ui.add_space(6.0);
++            egui::CollapsingHeader::new("音声入出力・アプリ追加")
++                .id_salt("audio_io_controls")
++                .default_open(false)
++                .show(ui, |ui| {
++                    ui.columns(2, |columns| {
++                        columns[0].label("PC音声デバイス");
++                        let selected_output = audio.selected_output_device();
++                        columns[0].add_enabled_ui(device_switch_enabled, |ui| {
++                            egui::ComboBox::from_id_salt("phase9_desktop_audio_device")
++                                .width(220.0)
++                                .selected_text(selection_label(&selected_output, &output_devices))
++                                .show_ui(ui, |ui| {
++                                    if ui.selectable_label(
++                                        selected_output == AudioDeviceSelection::Default,
++                                        "Windows既定",
++                                    ).clicked() {
++                                        audio.set_output_device(AudioDeviceSelection::Default);
++                                    }
++                                    for device in &output_devices {
++                                        let selection = AudioDeviceSelection::DeviceId(device.id.clone());
++                                        if ui.selectable_label(selected_output == selection, &device.name).clicked() {
++                                            audio.set_output_device(selection);
++                                        }
++                                    }
++                                });
++                        });
++
++                        columns[1].label("マイクデバイス");
++                        let selected_input = audio.selected_input_device();
++                        columns[1].add_enabled_ui(device_switch_enabled, |ui| {
++                            egui::ComboBox::from_id_salt("phase9_microphone_audio_device")
++                                .width(220.0)
++                                .selected_text(selection_label(&selected_input, &input_devices))
++                                .show_ui(ui, |ui| {
++                                    if ui.selectable_label(
++                                        selected_input == AudioDeviceSelection::Default,
++                                        "Windows既定",
++                                    ).clicked() {
++                                        audio.set_input_device(AudioDeviceSelection::Default);
++                                    }
++                                    for device in &input_devices {
++                                        let selection = AudioDeviceSelection::DeviceId(device.id.clone());
++                                        if ui.selectable_label(selected_input == selection, &device.name).clicked() {
++                                            audio.set_input_device(selection);
++                                        }
++                                    }
++                                });
++                        });
++                    });
++
++                    ui.separator();
++                    let mut ui_state_guard = match ui_state.lock() {
++                        Ok(guard) => guard,
++                        Err(_) => {
++                            ui.label("ミキサーUI状態を取得できません");
++                            return;
++                        }
++                    };
++                    let app_sources = audio.application_sources();
++                    let selected_app_label = ui_state_guard
++                        .selected_application_audio_pid
++                        .and_then(|pid| app_sources.iter().find(|source| source.capture_process_id == pid))
++                        .map(application_source_label)
++                        .unwrap_or_else(|| "アプリ音声を選択".to_owned());
++
++                    ui.horizontal(|ui| {
++                        egui::ComboBox::from_id_salt("phase9_application_audio_source")
++                            .width(220.0)
++                            .selected_text(compact_source_name(&selected_app_label, 28))
++                            .show_ui(ui, |ui| {
++                                if app_sources.is_empty() {
++                                    ui.label("音声を使用中のアプリがありません");
++                                }
++                                for source in &app_sources {
++                                    let label = application_source_label(source);
++                                    if ui.selectable_label(
++                                        ui_state_guard.selected_application_audio_pid == Some(source.capture_process_id),
++                                        &label,
++                                    ).on_hover_text(&label).clicked() {
++                                        ui_state_guard.selected_application_audio_pid = Some(source.capture_process_id);
++                                    }
++                                }
++                            });
++
++                        let selected_source = ui_state_guard
++                            .selected_application_audio_pid
++                            .and_then(|pid| app_sources.iter().find(|source| source.capture_process_id == pid).cloned());
++                        if ui.add_enabled(
++                            selected_source.is_some() && device_switch_enabled,
++                            egui::Button::new("＋ アプリ音声"),
++                        ).clicked() {
++                            if let Some(source) = selected_source {
++                                match audio.add_application_channel(source) {
++                                    Ok(_) => {
++                                        ui_state_guard.application_audio_message =
++                                            "アプリ音声チャンネルを追加しました".to_owned();
++                                    }
++                                    Err(err) => {
++                                        ui_state_guard.application_audio_message =
++                                            format!("アプリ音声追加失敗: {err}");
++                                    }
++                                }
++                            }
++                        }
++                    });
++
++                    ui.horizontal(|ui| {
++                        if ui.add_enabled(device_switch_enabled, egui::Button::new("アプリ音声一覧更新")).clicked() {
++                            match audio.refresh_application_sources() {
++                                Ok(()) => {
++                                    ui_state_guard.application_audio_message =
++                                        "アプリ音声一覧を更新しました".to_owned();
++                                }
++                                Err(err) => {
++                                    ui_state_guard.application_audio_message =
++                                        format!("アプリ音声一覧更新失敗: {err}");
++                                }
++                            }
++                        }
++                        if ui.add_enabled(device_switch_enabled, egui::Button::new("音声デバイス更新")).clicked() {
++                            match audio.refresh_devices() {
++                                Ok(()) => {
++                                    ui_state_guard.audio_message = "音声デバイス一覧を更新しました".to_owned();
++                                }
++                                Err(err) => {
++                                    ui_state_guard.audio_message = format!("デバイス更新失敗: {err}");
++                                }
++                            }
++                        }
++                    });
++                    ui.small(&ui_state_guard.application_audio_message);
++                    ui.small(&ui_state_guard.audio_message);
++                    if !device_switch_enabled {
++                        if let Some(reason) = &snapshot.device_switch_reason {
++                            ui.small(reason);
++                        }
++                    }
++                });
++
++            egui::CollapsingHeader::new("音声ルーティング説明")
++                .id_salt("audio_routing_help")
++                .default_open(false)
++                .show(ui, |ui| {
++                    ui.small("個別WAVは原音のまま保存（Gain/Muteは非破壊）");
++                    ui.small("Mix ONのチャンネルだけ完成MP4・配信Mixへ合流");
++                    ui.small("個別WAV保存 OFFでもMix用の一時原音は録画後に自動削除");
++                });
++        } else {
++            ui.label("音声デバイスを取得できていません");
++        }
++
++    // BGMプレイヤー自体はメインAppが所有するため、操作だけコマンドで返す。
++    for (id, gain_percent) in bgm_mixer_gain_changes {
++        send_mixer_command(
++            mixer_ctx,
++            command_tx,
++            MixerViewportCommand::BgmGain {
++                layer_id: id,
++                gain_percent,
++            },
++        );
++    }
++    for (id, muted) in bgm_mixer_mute_changes {
++        send_mixer_command(
++            mixer_ctx,
++            command_tx,
++            MixerViewportCommand::BgmMute { layer_id: id, muted },
++        );
++    }
++    if let Some(id) = bgm_mixer_remove {
++        send_mixer_command(
++            mixer_ctx,
++            command_tx,
++            MixerViewportCommand::RemoveBgm { layer_id: id },
++        );
++    }
++
++    ui.small("BGMのMix/WAVと実レベルメーターはPhase 8B-Audioで直接PCM統合します");
++    if let Ok(state) = ui_state.lock() {
++        ui.small(&state.audio_message);
++    }
++}
++
++
+ pub struct YaoyorozuApp {
+     vm: StreamViewModel,
+     elapsed_ms: u64,
+@@ -929,13 +1407,14 @@
+     mixer_window_open: bool,
+     mixer_window_position: Option<[f32; 2]>,
+     mixer_window_size: Option<[f32; 2]>,
++    mixer_snapshot: Arc<RwLock<MixerRenderSnapshot>>,
++    mixer_ui_state: Arc<Mutex<DeferredMixerUiState>>,
++    mixer_command_tx: mpsc::Sender<MixerViewportCommand>,
++    mixer_command_rx: mpsc::Receiver<MixerViewportCommand>,
+ 
+     capture_message: String,
+     font_message: String,
+-    audio: Option<AudioWorker>,
+-    audio_message: String,
+-    selected_application_audio_pid: Option<u32>,
+-    application_audio_message: String,
++    audio: Option<Arc<AudioWorker>>,
+     recording: Option<RecordingSession>,
+     finalize_rx: Option<mpsc::Receiver<Result<RecordingPaths, stream_recording::RecordingError>>>,
+     recording_message: String,
+@@ -1179,7 +1658,7 @@
+                 if let Some(id) = persisted_settings.input_device_id.clone() {
+                     worker.set_input_device(AudioDeviceSelection::DeviceId(id));
+                 }
+-                (Some(worker), "WASAPI音声メーター: 稼働中".to_owned())
++                (Some(Arc::new(worker)), "WASAPI音声メーター: 稼働中".to_owned())
+             }
+             Err(err) => (None, format!("音声開始失敗: {err}")),
+         };
+@@ -1234,6 +1713,17 @@
+         let preview_ui_state = Arc::new(Mutex::new(DeferredPreviewUiState::default()));
+         let (preview_command_tx, preview_command_rx) = mpsc::channel();
+ 
++        let mixer_snapshot = Arc::new(RwLock::new(MixerRenderSnapshot {
++            bgm_rows: Vec::new(),
++            device_switch_enabled: true,
++            device_switch_reason: None,
++        }));
++        let mixer_ui_state = Arc::new(Mutex::new(DeferredMixerUiState {
++            audio_message: audio_message.clone(),
++            ..DeferredMixerUiState::default()
++        }));
++        let (mixer_command_tx, mixer_command_rx) = mpsc::channel();
++
+         Self {
+             vm,
+             elapsed_ms: 0,
+@@ -1258,12 +1748,13 @@
+                 persisted_settings.mixer_window.position,
+             ),
+             mixer_window_size: sanitize_window_size(persisted_settings.mixer_window.size),
++            mixer_snapshot,
++            mixer_ui_state,
++            mixer_command_tx,
++            mixer_command_rx,
+             capture_message,
+             font_message,
+             audio,
+-            audio_message,
+-            selected_application_audio_pid: None,
+-            application_audio_message: "アプリ音声: 一覧から選択してください".to_owned(),
+             recording: None,
+             finalize_rx: None,
+             recording_message: "録画: 待機中".to_owned(),
+@@ -1612,6 +2103,82 @@
+         }
+     }
+ 
++    fn sync_mixer_snapshot(&self) {
++        if let Ok(mut snapshot) = self.mixer_snapshot.write() {
++            snapshot.bgm_rows = self
++                .bgm_layers
++                .iter()
++                .map(|(id, source)| {
++                    (
++                        *id,
++                        source.name.clone(),
++                        source.volume_percent,
++                        source.muted,
++                    )
++                })
++                .collect();
++            snapshot.device_switch_enabled = self.recording.is_none()
++                && self.finalize_rx.is_none()
++                && self.streaming.is_none();
++            snapshot.device_switch_reason = if self.streaming.is_some() {
++                Some("配信中は音声デバイスとアプリ構成を固定します".to_owned())
++            } else if self.recording.is_some() || self.finalize_rx.is_some() {
++                Some("録画中は音声デバイスとアプリ構成を固定します".to_owned())
++            } else {
++                None
++            };
++        }
++    }
++
++    fn drain_mixer_commands(&mut self) {
++        while let Ok(command) = self.mixer_command_rx.try_recv() {
++            match command {
++                MixerViewportCommand::Close => {
++                    self.mixer_window_open = false;
++                }
++                MixerViewportCommand::Geometry { position, size } => {
++                    self.mixer_window_position = sanitize_window_position(position);
++                    self.mixer_window_size = sanitize_window_size(size);
++                }
++                MixerViewportCommand::BgmGain {
++                    layer_id,
++                    gain_percent,
++                } => {
++                    if let Some((_, source)) = self
++                        .bgm_layers
++                        .iter_mut()
++                        .find(|(id, _)| *id == layer_id)
++                    {
++                        source.volume_percent = gain_percent.clamp(0.0, 100.0);
++                        if let Some(player) = self.bgm_players.get(&layer_id) {
++                            player.set_volume(source.effective_volume());
++                        }
++                    }
++                }
++                MixerViewportCommand::BgmMute { layer_id, muted } => {
++                    if let Some((_, source)) = self
++                        .bgm_layers
++                        .iter_mut()
++                        .find(|(id, _)| *id == layer_id)
++                    {
++                        source.muted = muted;
++                        if let Some(player) = self.bgm_players.get(&layer_id) {
++                            player.set_volume(source.effective_volume());
++                        }
++                    }
++                }
++                MixerViewportCommand::RemoveBgm { layer_id } => {
++                    self.remove_bgm_layer(layer_id);
++                    self.bgm_message = if self.bgm_layers.is_empty() {
++                        "BGM: 未追加".to_owned()
++                    } else {
++                        format!("BGM削除 / 残り {} 曲", self.bgm_layers.len())
++                    };
++                }
++            }
++        }
++    }
++
+     fn push_streaming_frame_if_available(&mut self) {
+         if self.streaming.is_none() {
+             return;
+@@ -1964,421 +2531,6 @@
+             });
+     }
+ 
+-    fn draw_audio_mixer(&mut self, ui: &mut egui::Ui) {
+-        let levels = self
+-            .audio
+-            .as_ref()
+-            .map(|audio| audio.levels())
+-            .unwrap_or_default();
+-        // Phase 8A: BGMはまだWindows既定出力経由だが、
+-        // ミキサーからGain/Muteを直接操作できるようにする。
+-        // Mix/WAVの直接ルーティングはPhase 8Bでstream-audioへ統合する。
+-        let bgm_mixer_snapshot: Vec<_> = self
+-            .bgm_layers
+-            .iter()
+-            .map(|(id, source)| {
+-                (
+-                    *id,
+-                    source.name.clone(),
+-                    source.volume_percent,
+-                    source.muted,
+-                )
+-            })
+-            .collect();
+-        let mut bgm_mixer_gain_changes: Vec<(LayerId, f32)> = Vec::new();
+-        let mut bgm_mixer_mute_changes: Vec<(LayerId, bool)> = Vec::new();
+-        let mut bgm_mixer_remove: Option<LayerId> = None;
+-
+-        if let Some(audio) = &self.audio {
+-            let settings = audio.mixer_settings();
+-            let output_devices = audio.output_devices();
+-            let input_devices = audio.input_devices();
+-            let device_switch_enabled = self.recording.is_none()
+-                && self.finalize_rx.is_none()
+-                && self.streaming.is_none();
+-            let all_channels = audio.audio_channels();
+-            let desktop_channel = all_channels
+-                .iter()
+-                .find(|channel| channel.id == ChannelMixerControl::DESKTOP_ID)
+-                .cloned();
+-            let microphone_channel = all_channels
+-                .iter()
+-                .find(|channel| channel.id == ChannelMixerControl::MICROPHONE_ID)
+-                .cloned();
+-            let application_channels: Vec<_> = all_channels
+-                .into_iter()
+-                .filter(|channel| channel.kind == AudioChannelKind::Application)
+-                .collect();
+-
+-            // Mixer stripには長いWASAPIステータス文字列をそのまま出さない。
+-            // Windows既定を使っている場合は短い「Win規定」に統一して、
+-            // PC音声 / マイク / Master の3段目の高さを揃える。
+-            let selected_output = audio.selected_output_device();
+-            let desktop_source_label = match &selected_output {
+-                AudioDeviceSelection::Default => "Win規定".to_owned(),
+-                AudioDeviceSelection::DeviceId(_) => compact_source_name(
+-                    &selection_label(&selected_output, &output_devices),
+-                    10,
+-                ),
+-            };
+-            let selected_input = audio.selected_input_device();
+-            let microphone_source_label = match &selected_input {
+-                AudioDeviceSelection::Default => "Win規定".to_owned(),
+-                AudioDeviceSelection::DeviceId(_) => compact_source_name(
+-                    &selection_label(&selected_input, &input_devices),
+-                    10,
+-                ),
+-            };
+-
+-            ui.small("同一サイズのチャンネルストリップ / PC・マイク・BGM・アプリ音声・Masterを同じ基準で表示します");
+-            ui.add_space(4.0);
+-
+-            let mut remove_channel = None;
+-            egui::ScrollArea::horizontal()
+-                .id_salt("vertical_audio_mixer_channels")
+-                .auto_shrink([false, true])
+-                .show(ui, |ui| {
+-                    ui.horizontal_top(|ui| {
+-                        ui.spacing_mut().item_spacing.x = 4.0;
+-
+-                        let desktop_strip = draw_mixer_channel_strip(
+-                            ui,
+-                            MixerStripModel {
+-                                title: "PC音声".to_owned(),
+-                                source: desktop_source_label,
+-                                level: levels.desktop,
+-                                gain_percent: settings.desktop_gain * 100.0,
+-                                mute: Some(settings.desktop_muted),
+-                                mix: desktop_channel.as_ref().map(|c| c.include_in_stream_mix),
+-                                wav: desktop_channel.as_ref().map(|c| c.record_individual),
+-                                removable: false,
+-                            },
+-                        );
+-                        if desktop_strip.gain_changed {
+-                            audio.set_desktop_gain(desktop_strip.gain_percent / 100.0);
+-                        }
+-                        if desktop_strip.mute != Some(settings.desktop_muted) {
+-                            if let Some(muted) = desktop_strip.mute {
+-                                audio.set_desktop_muted(muted);
+-                            }
+-                        }
+-                        if let Some(channel) = &desktop_channel {
+-                            if desktop_strip.mix != Some(channel.include_in_stream_mix) {
+-                                if let Some(in_mix) = desktop_strip.mix {
+-                                    audio.set_channel_include_in_stream_mix(channel.id, in_mix);
+-                                }
+-                            }
+-                            if desktop_strip.wav != Some(channel.record_individual) {
+-                                if let Some(record) = desktop_strip.wav {
+-                                    audio.set_channel_record_individual(channel.id, record);
+-                                }
+-                            }
+-                        }
+-
+-                        let microphone_strip = draw_mixer_channel_strip(
+-                            ui,
+-                            MixerStripModel {
+-                                title: "マイク".to_owned(),
+-                                source: microphone_source_label,
+-                                level: levels.mic,
+-                                gain_percent: settings.mic_gain * 100.0,
+-                                mute: Some(settings.mic_muted),
+-                                mix: microphone_channel.as_ref().map(|c| c.include_in_stream_mix),
+-                                wav: microphone_channel.as_ref().map(|c| c.record_individual),
+-                                removable: false,
+-                            },
+-                        );
+-                        if microphone_strip.gain_changed {
+-                            audio.set_mic_gain(microphone_strip.gain_percent / 100.0);
+-                        }
+-                        if microphone_strip.mute != Some(settings.mic_muted) {
+-                            if let Some(muted) = microphone_strip.mute {
+-                                audio.set_mic_muted(muted);
+-                            }
+-                        }
+-                        if let Some(channel) = &microphone_channel {
+-                            if microphone_strip.mix != Some(channel.include_in_stream_mix) {
+-                                if let Some(in_mix) = microphone_strip.mix {
+-                                    audio.set_channel_include_in_stream_mix(channel.id, in_mix);
+-                                }
+-                            }
+-                            if microphone_strip.wav != Some(channel.record_individual) {
+-                                if let Some(record) = microphone_strip.wav {
+-                                    audio.set_channel_record_individual(channel.id, record);
+-                                }
+-                            }
+-                        }
+-
+-                        for (bgm_id, bgm_name, volume_percent, muted) in &bgm_mixer_snapshot {
+-                            let bgm_strip = draw_mixer_channel_strip(
+-                                ui,
+-                                MixerStripModel {
+-                                    title: "BGM".to_owned(),
+-                                    source: bgm_name.clone(),
+-                                    // Phase 8AではPCMメーターはまだstream-audio未統合。
+-                                    // ストリップ構造を先に統一し、実レベルは8Bで接続する。
+-                                    level: 0.0,
+-                                    gain_percent: *volume_percent,
+-                                    mute: Some(*muted),
+-                                    mix: None,
+-                                    wav: None,
+-                                    removable: true,
+-                                },
+-                            );
+-                            if bgm_strip.gain_changed {
+-                                bgm_mixer_gain_changes.push((*bgm_id, bgm_strip.gain_percent));
+-                            }
+-                            if bgm_strip.mute != Some(*muted) {
+-                                if let Some(new_muted) = bgm_strip.mute {
+-                                    bgm_mixer_mute_changes.push((*bgm_id, new_muted));
+-                                }
+-                            }
+-                            if bgm_strip.remove_clicked {
+-                                bgm_mixer_remove = Some(*bgm_id);
+-                            }
+-                        }
+-
+-                        for channel in &application_channels {
+-                            let source = channel
+-                                .process_id
+-                                .map(|pid| format!("PID {pid}"))
+-                                .unwrap_or_else(|| "アプリ音声".to_owned());
+-                            let app_strip = draw_mixer_channel_strip(
+-                                ui,
+-                                MixerStripModel {
+-                                    title: channel.name.clone(),
+-                                    source,
+-                                    level: channel.current_level,
+-                                    gain_percent: channel.gain * 100.0,
+-                                    mute: Some(channel.muted),
+-                                    mix: Some(channel.include_in_stream_mix),
+-                                    wav: Some(channel.record_individual),
+-                                    removable: true,
+-                                },
+-                            );
+-                            if app_strip.gain_changed {
+-                                audio.set_channel_gain(channel.id, app_strip.gain_percent / 100.0);
+-                            }
+-                            if app_strip.mute != Some(channel.muted) {
+-                                if let Some(muted) = app_strip.mute {
+-                                    audio.set_channel_muted(channel.id, muted);
+-                                }
+-                            }
+-                            if app_strip.mix != Some(channel.include_in_stream_mix) {
+-                                if let Some(in_mix) = app_strip.mix {
+-                                    audio.set_channel_include_in_stream_mix(channel.id, in_mix);
+-                                }
+-                            }
+-                            if app_strip.wav != Some(channel.record_individual) {
+-                                if let Some(record) = app_strip.wav {
+-                                    audio.set_channel_record_individual(channel.id, record);
+-                                }
+-                            }
+-                            if app_strip.remove_clicked {
+-                                remove_channel = Some(channel.id);
+-                            }
+-                        }
+-
+-                        let master_strip = draw_mixer_channel_strip(
+-                            ui,
+-                            MixerStripModel {
+-                                title: "Master".to_owned(),
+-                                source: "配信Mix".to_owned(),
+-                                level: levels.mix,
+-                                gain_percent: settings.master_gain * 100.0,
+-                                mute: None,
+-                                mix: None,
+-                                wav: None,
+-                                removable: false,
+-                            },
+-                        );
+-                        if master_strip.gain_changed {
+-                            audio.set_master_gain(master_strip.gain_percent / 100.0);
+-                        }
+-                    });
+-                });
+-
+-            if let Some(id) = remove_channel {
+-                audio.remove_audio_channel(id);
+-            }
+-
+-            ui.add_space(6.0);
+-            egui::CollapsingHeader::new("音声入出力・アプリ追加")
+-                .id_salt("audio_io_controls")
+-                .default_open(false)
+-                .show(ui, |ui| {
+-                    ui.columns(2, |columns| {
+-                        columns[0].label("PC音声デバイス");
+-                        let selected_output = audio.selected_output_device();
+-                        columns[0].add_enabled_ui(device_switch_enabled, |ui| {
+-                            egui::ComboBox::from_id_salt("phase9_desktop_audio_device")
+-                                .width(220.0)
+-                                .selected_text(selection_label(&selected_output, &output_devices))
+-                                .show_ui(ui, |ui| {
+-                                    if ui.selectable_label(
+-                                        selected_output == AudioDeviceSelection::Default,
+-                                        "Windows既定",
+-                                    ).clicked() {
+-                                        audio.set_output_device(AudioDeviceSelection::Default);
+-                                    }
+-                                    for device in &output_devices {
+-                                        let selection = AudioDeviceSelection::DeviceId(device.id.clone());
+-                                        if ui.selectable_label(selected_output == selection, &device.name).clicked() {
+-                                            audio.set_output_device(selection);
+-                                        }
+-                                    }
+-                                });
+-                        });
+-
+-                        columns[1].label("マイクデバイス");
+-                        let selected_input = audio.selected_input_device();
+-                        columns[1].add_enabled_ui(device_switch_enabled, |ui| {
+-                            egui::ComboBox::from_id_salt("phase9_microphone_audio_device")
+-                                .width(220.0)
+-                                .selected_text(selection_label(&selected_input, &input_devices))
+-                                .show_ui(ui, |ui| {
+-                                    if ui.selectable_label(
+-                                        selected_input == AudioDeviceSelection::Default,
+-                                        "Windows既定",
+-                                    ).clicked() {
+-                                        audio.set_input_device(AudioDeviceSelection::Default);
+-                                    }
+-                                    for device in &input_devices {
+-                                        let selection = AudioDeviceSelection::DeviceId(device.id.clone());
+-                                        if ui.selectable_label(selected_input == selection, &device.name).clicked() {
+-                                            audio.set_input_device(selection);
+-                                        }
+-                                    }
+-                                });
+-                        });
+-                    });
+-
+-                    ui.separator();
+-                    let app_sources = audio.application_sources();
+-                    let selected_app_label = self
+-                        .selected_application_audio_pid
+-                        .and_then(|pid| app_sources.iter().find(|source| source.capture_process_id == pid))
+-                        .map(application_source_label)
+-                        .unwrap_or_else(|| "アプリ音声を選択".to_owned());
+-
+-                    ui.horizontal(|ui| {
+-                        egui::ComboBox::from_id_salt("phase9_application_audio_source")
+-                            .width(220.0)
+-                            .selected_text(compact_source_name(&selected_app_label, 28))
+-                            .show_ui(ui, |ui| {
+-                                if app_sources.is_empty() {
+-                                    ui.label("音声を使用中のアプリがありません");
+-                                }
+-                                for source in &app_sources {
+-                                    let label = application_source_label(source);
+-                                    if ui.selectable_label(
+-                                        self.selected_application_audio_pid == Some(source.capture_process_id),
+-                                        &label,
+-                                    ).on_hover_text(&label).clicked() {
+-                                        self.selected_application_audio_pid = Some(source.capture_process_id);
+-                                    }
+-                                }
+-                            });
+-
+-                        let selected_source = self
+-                            .selected_application_audio_pid
+-                            .and_then(|pid| app_sources.iter().find(|source| source.capture_process_id == pid).cloned());
+-                        if ui.add_enabled(
+-                            selected_source.is_some() && device_switch_enabled,
+-                            egui::Button::new("＋ アプリ音声"),
+-                        ).clicked() {
+-                            if let Some(source) = selected_source {
+-                                match audio.add_application_channel(source) {
+-                                    Ok(_) => {
+-                                        self.application_audio_message =
+-                                            "アプリ音声チャンネルを追加しました".to_owned();
+-                                    }
+-                                    Err(err) => {
+-                                        self.application_audio_message =
+-                                            format!("アプリ音声追加失敗: {err}");
+-                                    }
+-                                }
+-                            }
+-                        }
+-                    });
+-
+-                    ui.horizontal(|ui| {
+-                        if ui.add_enabled(device_switch_enabled, egui::Button::new("アプリ音声一覧更新")).clicked() {
+-                            match audio.refresh_application_sources() {
+-                                Ok(()) => {
+-                                    self.application_audio_message =
+-                                        "アプリ音声一覧を更新しました".to_owned();
+-                                }
+-                                Err(err) => {
+-                                    self.application_audio_message =
+-                                        format!("アプリ音声一覧更新失敗: {err}");
+-                                }
+-                            }
+-                        }
+-                        if ui.add_enabled(device_switch_enabled, egui::Button::new("音声デバイス更新")).clicked() {
+-                            match audio.refresh_devices() {
+-                                Ok(()) => {
+-                                    self.audio_message = "音声デバイス一覧を更新しました".to_owned();
+-                                }
+-                                Err(err) => {
+-                                    self.audio_message = format!("デバイス更新失敗: {err}");
+-                                }
+-                            }
+-                        }
+-                    });
+-                    ui.small(&self.application_audio_message);
+-                    ui.small(&self.audio_message);
+-                    if !device_switch_enabled {
+-                        ui.small(if self.streaming.is_some() {
+-                            "配信中は音声デバイスとアプリ構成を固定します"
+-                        } else {
+-                            "録画中は音声デバイスとアプリ構成を固定します"
+-                        });
+-                    }
+-                });
+-
+-            egui::CollapsingHeader::new("音声ルーティング説明")
+-                .id_salt("audio_routing_help")
+-                .default_open(false)
+-                .show(ui, |ui| {
+-                    ui.small("個別WAVは原音のまま保存（Gain/Muteは非破壊）");
+-                    ui.small("Mix ONのチャンネルだけ完成MP4・配信Mixへ合流");
+-                    ui.small("個別WAV保存 OFFでもMix用の一時原音は録画後に自動削除");
+-                });
+-        } else {
+-            ui.label("音声デバイスを取得できていません");
+-        }
+-
+-        // BGM操作はaudioへの借用を解放してから反映する。
+-        for (id, gain_percent) in bgm_mixer_gain_changes {
+-            if let Some((_, source)) = self.bgm_layers.iter_mut().find(|(layer_id, _)| *layer_id == id) {
+-                source.volume_percent = gain_percent.clamp(0.0, 100.0);
+-                if let Some(player) = self.bgm_players.get(&id) {
+-                    player.set_volume(source.effective_volume());
+-                }
+-            }
+-        }
+-        for (id, muted) in bgm_mixer_mute_changes {
+-            if let Some((_, source)) = self.bgm_layers.iter_mut().find(|(layer_id, _)| *layer_id == id) {
+-                source.muted = muted;
+-                if let Some(player) = self.bgm_players.get(&id) {
+-                    player.set_volume(source.effective_volume());
+-                }
+-            }
+-        }
+-        if let Some(id) = bgm_mixer_remove {
+-            self.remove_bgm_layer(id);
+-            self.bgm_message = if self.bgm_layers.is_empty() {
+-                "BGM: 未追加".to_owned()
+-            } else {
+-                format!("BGM削除 / 残り {} 曲", self.bgm_layers.len())
+-            };
+-        }
+-
+-        ui.small("BGMのMix/WAVと実レベルメーターはPhase 8Bで直接PCM統合します");
+-        ui.small(&self.audio_message);
+-    }
+-
+     fn show_mixer_viewport(&mut self, ctx: &egui::Context) {
+         if !self.mixer_window_open {
+             return;
+@@ -2387,6 +2539,15 @@
+         self.mixer_window_position = sanitize_window_position(self.mixer_window_position);
+         self.mixer_window_size = sanitize_window_size(self.mixer_window_size);
+ 
++        if let Ok(mut state) = self.mixer_ui_state.lock() {
++            if state.last_window_position.is_none() {
++                state.last_window_position = self.mixer_window_position;
++            }
++            if state.last_window_size.is_none() {
++                state.last_window_size = self.mixer_window_size;
++            }
++        }
++
+         let viewport_id = egui::ViewportId::from_hash_of("tsubame_audio_mixer_window");
+         let mut builder = egui::ViewportBuilder::default()
+             .with_title("燕 - 音声ミキサー")
+@@ -2396,49 +2557,68 @@
+             builder = builder.with_position([x, y]);
+         }
+ 
+-        let mut close_requested = false;
+-        ctx.show_viewport_immediate(viewport_id, builder, |mixer_ctx, _class| {
++        let audio = self.audio.as_ref().map(Arc::clone);
++        let snapshot = Arc::clone(&self.mixer_snapshot);
++        let ui_state = Arc::clone(&self.mixer_ui_state);
++        let command_tx = self.mixer_command_tx.clone();
++
++        ctx.show_viewport_deferred(viewport_id, builder, move |mixer_ctx, _class| {
+             let viewport_info = mixer_ctx.input(|input| input.viewport().clone());
+             if viewport_info.close_requested() {
+-                close_requested = true;
++                send_mixer_command(mixer_ctx, &command_tx, MixerViewportCommand::Close);
++                return;
+             }
+ 
+-            // Do not clamp against monitor_size while the window is alive.
+-            // outer_rect is in desktop coordinates, while monitor_size is only
+-            // the current monitor's size. Comparing them directly breaks
+-            // secondary-monitor placement. Let Windows resolve unavailable
+-            // monitor coordinates when the viewport is created, then persist
+-            // the actual OS-resolved geometry reported here.
+-            if let Some(outer_rect) = viewport_info.outer_rect {
+-                self.mixer_window_position = sanitize_window_position(Some([
+-                    outer_rect.min.x,
+-                    outer_rect.min.y,
+-                ]));
+-            }
+-            if let Some(inner_rect) = viewport_info.inner_rect {
+-                self.mixer_window_size = sanitize_window_size(Some([
+-                    inner_rect.width(),
+-                    inner_rect.height(),
+-                ]));
++            let position = viewport_info
++                .outer_rect
++                .map(|rect| [rect.min.x, rect.min.y]);
++            let size = viewport_info
++                .inner_rect
++                .map(|rect| [rect.width(), rect.height()]);
++
++            let mut geometry_command = None;
++            if let Ok(mut state) = ui_state.lock() {
++                let observed_position = position.or(state.last_window_position);
++                let observed_size = size.or(state.last_window_size);
++                let changed = geometry_changed(state.last_window_position, observed_position)
++                    || geometry_changed(state.last_window_size, observed_size);
++                if changed {
++                    state.last_window_position = observed_position;
++                    state.last_window_size = observed_size;
++                    geometry_command = Some(MixerViewportCommand::Geometry {
++                        position: observed_position,
++                        size: observed_size,
++                    });
++                }
++            }
++            if let Some(command) = geometry_command {
++                send_mixer_command(mixer_ctx, &command_tx, command);
+             }
+ 
++            let snapshot_value = snapshot.read().map(|value| value.clone()).unwrap_or_default();
++
+             egui::CentralPanel::default().show(mixer_ctx, |ui| {
+                 ui.horizontal(|ui| {
+                     ui.heading("音声ミキサー");
+                     ui.separator();
+                     ui.small("閉じても配信・録画・BGM音声は継続");
+                     if ui.button("閉じる").clicked() {
+-                        close_requested = true;
++                        send_mixer_command(mixer_ctx, &command_tx, MixerViewportCommand::Close);
+                     }
+                 });
+                 ui.separator();
+-                self.draw_audio_mixer(ui);
++                draw_deferred_audio_mixer(
++                    mixer_ctx,
++                    ui,
++                    audio.as_ref(),
++                    &snapshot_value,
++                    &ui_state,
++                    &command_tx,
++                );
+             });
+-        });
+ 
+-        if close_requested {
+-            self.mixer_window_open = false;
+-        }
++            mixer_ctx.request_repaint_after(Duration::from_millis(mixer_ui_repaint_ms(true)));
++        });
+     }
+ 
+     fn show_preview_viewport(&mut self, ctx: &egui::Context) {
+@@ -2702,6 +2882,7 @@
+ impl eframe::App for YaoyorozuApp {
+     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+         self.drain_preview_commands();
++        self.drain_mixer_commands();
+         self.bgm_players.retain(|_, player| !player.is_finished());
+         self.poll_recording_finalize();
+         self.poll_streaming();
+@@ -2710,6 +2891,7 @@
+         self.sync_preview_dimensions_from_latest();
+         self.push_streaming_frame_if_available();
+         self.sync_preview_snapshot();
++        self.sync_mixer_snapshot();
+         self.show_preview_viewport(ctx);
+         self.show_mixer_viewport(ctx);
+         self.show_settings_window(ctx);
+@@ -3366,9 +3548,9 @@
+             self.elapsed_ms = self.elapsed_ms.saturating_add(16);
+         }
+ 
+-        // Main controls and deferred preview no longer share the same repaint clock.
+-        // Sync any controls changed during this pass, then let the preview viewport
+-        // continue at its own 30 FPS cadence.
++        // Main controls, deferred preview, and deferred mixer no longer share the same repaint clock.
++        // Sync controls changed during this pass, then let child viewports continue
++        // at their own repaint cadences.
+         self.sync_preview_snapshot();
+         let repaint_ms = main_ui_repaint_ms(
+             self.streaming.is_some(),
+@@ -3382,7 +3564,7 @@
+ 
+ #[cfg(test)]
+ mod toolbar_tests {
+-    use super::{main_ui_repaint_ms, toggle_window_open};
++    use super::{main_ui_repaint_ms, mixer_ui_repaint_ms, toggle_window_open};
+     use stream_capture::PreviewMode;
+ 
+     #[test]
+@@ -3405,4 +3587,16 @@
+         );
+     }
+ 
++    #[test]
++    fn deferred_mixer_uses_independent_meter_repaint_period() {
++        assert_eq!(mixer_ui_repaint_ms(true), 33);
++        assert_eq!(mixer_ui_repaint_ms(false), 250);
++    }
++
++    #[test]
++    fn audio_worker_can_be_shared_with_deferred_mixer() {
++        fn assert_send_sync<T: Send + Sync>() {}
++        assert_send_sync::<stream_audio::AudioWorker>();
++    }
++
+ }

@@ -1,12 +1,5 @@
 use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
-use std::{
-    fmt,
-    path::PathBuf,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
-};
+use std::{fmt, path::PathBuf, sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}}};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CaptureBackend {
@@ -34,9 +27,7 @@ pub struct PreviewPolicy {
 
 impl PreviewPolicy {
     pub fn normal() -> Self {
-        Self {
-            mode: PreviewMode::Fps30,
-        }
+        Self { mode: PreviewMode::Fps30 }
     }
 
     pub fn for_recording(mode: PreviewMode) -> Self {
@@ -78,6 +69,7 @@ impl CaptureSource {
     }
 }
 
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CaptureStats {
     pub received_frames: u64,
@@ -114,7 +106,10 @@ impl CaptureFrame {
 
 #[cfg(windows)]
 fn d3d_none_error(context: &'static str) -> windows::core::Error {
-    windows::core::Error::new(windows::core::HRESULT(0x80004005u32 as i32), context)
+    windows::core::Error::new(
+        windows::core::HRESULT(0x80004005u32 as i32),
+        context,
+    )
 }
 
 pub fn preview_dimensions(width: u32, height: u32) -> (u32, u32) {
@@ -161,21 +156,45 @@ pub fn pack_pitched_rgba(src: &[u8], row_pitch: usize, width: u32, height: u32) 
     out
 }
 
+#[derive(Clone, Default)]
+pub struct LatestFrameSnapshot {
+    latest: Arc<Mutex<Option<CaptureFrame>>>,
+}
+
+impl LatestFrameSnapshot {
+    fn store(&self, frame: CaptureFrame) {
+        if let Ok(mut latest) = self.latest.lock() {
+            *latest = Some(frame);
+        }
+    }
+
+    pub fn latest_frame(&self) -> Option<CaptureFrame> {
+        self.latest.lock().ok().and_then(|latest| latest.clone())
+    }
+}
+
 #[derive(Clone)]
 pub struct FrameQueue {
     tx: Sender<CaptureFrame>,
     rx: Receiver<CaptureFrame>,
+    latest: LatestFrameSnapshot,
 }
 
 impl FrameQueue {
     pub fn new(capacity: usize) -> Self {
         let (tx, rx) = bounded(capacity.max(1));
-        Self { tx, rx }
+        Self {
+            tx,
+            rx,
+            latest: LatestFrameSnapshot::default(),
+        }
     }
 
     /// Non-blocking newest-frame queue.
     /// No pixel-buffer clone occurs: CaptureFrame uses Arc<[u8]>.
     pub fn push_latest(&self, frame: CaptureFrame) {
+        self.latest.store(frame.clone());
+
         match self.tx.try_send(frame) {
             Ok(()) => {}
             Err(crossbeam_channel::TrySendError::Full(frame)) => {
@@ -193,7 +212,18 @@ impl FrameQueue {
     pub fn receiver(&self) -> Receiver<CaptureFrame> {
         self.rx.clone()
     }
+
+    /// Return the newest preview frame without consuming the delivery queue.
+    pub fn latest_frame(&self) -> Option<CaptureFrame> {
+        self.latest.latest_frame()
+    }
+
+    /// Cheap cloneable handle for deferred preview windows.
+    pub fn latest_handle(&self) -> LatestFrameSnapshot {
+        self.latest.clone()
+    }
 }
+
 
 #[derive(Debug, Clone)]
 pub struct GpuRecordingConfig {
@@ -261,10 +291,9 @@ impl GpuRecordingHandle {
     }
 
     pub fn status(&self) -> GpuRecordingStatus {
-        self.status
-            .lock()
-            .map(|s| s.clone())
-            .unwrap_or_else(|_| GpuRecordingStatus::Failed("GPU録画状態ロック失敗".to_owned()))
+        self.status.lock().map(|s| s.clone()).unwrap_or_else(|_| {
+            GpuRecordingStatus::Failed("GPU録画状態ロック失敗".to_owned())
+        })
     }
 
     pub fn encoded_frames(&self) -> u64 {
@@ -338,6 +367,14 @@ impl CaptureWorker {
         self.preview_queue.try_recv()
     }
 
+    pub fn latest_preview_frame(&self) -> Option<CaptureFrame> {
+        self.preview_queue.latest_frame()
+    }
+
+    pub fn latest_preview_handle(&self) -> LatestFrameSnapshot {
+        self.preview_queue.latest_handle()
+    }
+
     pub fn backend(&self) -> CaptureBackend {
         CaptureBackend::WindowsGraphicsCapture
     }
@@ -369,8 +406,8 @@ impl Drop for CaptureWorker {
 
 #[cfg(windows)]
 mod wgc {
-    use super::{CaptureError, CaptureFrame, CaptureSource, CaptureWorker, FrameQueue, WindowInfo};
     use crate::{pack_pitched_rgba, preview_dimensions, PreviewMode, PreviewPolicy};
+    use super::{CaptureError, CaptureFrame, CaptureSource, CaptureWorker, FrameQueue, WindowInfo};
     use std::{
         error::Error,
         ffi::c_void,
@@ -384,8 +421,8 @@ mod wgc {
         capture::{Context, GraphicsCaptureApiHandler},
         d3d11::{SendDirectX, StagingTexture},
         encoder::{
-            AudioSettingsBuilder, ContainerSettingsBuilder, VideoEncoder, VideoSettingsBuilder,
-            VideoSettingsSubType,
+            AudioSettingsBuilder, ContainerSettingsBuilder, VideoEncoder,
+            VideoSettingsBuilder, VideoSettingsSubType,
         },
         frame::Frame,
         graphics_capture_api::InternalCaptureControl,
@@ -397,28 +434,31 @@ mod wgc {
         window::Window,
     };
 
+
     use windows::{
         core::Interface,
         Win32::{
             Foundation::RECT,
             Graphics::{
                 Direct3D11::{
-                    ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D, ID3D11VideoContext,
-                    ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
-                    ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET,
-                    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
-                    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-                    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
-                    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
+                    D3D11_BIND_RENDER_TARGET, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+                    D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC,
+                    D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+                    D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
+                    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
                     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
-                    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
-                    D3D11_VIDEO_USAGE_OPTIMAL_SPEED, D3D11_VPIV_DIMENSION_TEXTURE2D,
-                    D3D11_VPOV_DIMENSION_TEXTURE2D,
+                    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
+                    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_OPTIMAL_SPEED,
+                    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D,
+                    ID3D11DeviceContext, ID3D11Multithread, ID3D11Texture2D,
+                    ID3D11VideoContext, ID3D11VideoDevice, ID3D11VideoProcessor,
+                    ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorOutputView,
                 },
                 Dxgi::Common::{DXGI_RATIONAL, DXGI_SAMPLE_DESC},
             },
         },
     };
+
 
     struct GpuPreviewScaler {
         input_width: u32,
@@ -436,11 +476,7 @@ mod wgc {
     }
 
     impl GpuPreviewScaler {
-        fn new(
-            frame: &Frame,
-            output_width: u32,
-            output_height: u32,
-        ) -> windows::core::Result<Self> {
+        fn new(frame: &Frame, output_width: u32, output_height: u32) -> windows::core::Result<Self> {
             let input_width = frame.width();
             let input_height = frame.height();
             let format = frame.desc().Format;
@@ -465,8 +501,10 @@ mod wgc {
                 Usage: D3D11_VIDEO_USAGE_OPTIMAL_SPEED,
             };
 
-            let enumerator = unsafe { video_device.CreateVideoProcessorEnumerator(&content)? };
-            let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0)? };
+            let enumerator =
+                unsafe { video_device.CreateVideoProcessorEnumerator(&content)? };
+            let processor =
+                unsafe { video_device.CreateVideoProcessor(&enumerator, 0)? };
 
             let output_desc = D3D11_TEXTURE2D_DESC {
                 Width: output_width,
@@ -486,12 +524,15 @@ mod wgc {
 
             let mut output_texture = None;
             unsafe {
-                frame
-                    .device()
-                    .CreateTexture2D(&output_desc, None, Some(&mut output_texture))?;
+                frame.device().CreateTexture2D(
+                    &output_desc,
+                    None,
+                    Some(&mut output_texture),
+                )?;
             }
-            let output_texture = output_texture
-                .ok_or_else(|| crate::d3d_none_error("D3D11 object creation returned None"))?;
+            let output_texture = output_texture.ok_or_else(|| {
+                crate::d3d_none_error("D3D11 object creation returned None")
+            })?;
 
             let output_view_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
                 ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
@@ -509,8 +550,9 @@ mod wgc {
                     Some(&mut output_view),
                 )?;
             }
-            let output_view = output_view
-                .ok_or_else(|| crate::d3d_none_error("D3D11 object creation returned None"))?;
+            let output_view = output_view.ok_or_else(|| {
+                crate::d3d_none_error("D3D11 object creation returned None")
+            })?;
 
             let source_rect = RECT {
                 left: 0,
@@ -538,7 +580,11 @@ mod wgc {
                     true,
                     Some(&dest_rect),
                 );
-                video_context.VideoProcessorSetOutputTargetRect(&processor, true, Some(&dest_rect));
+                video_context.VideoProcessorSetOutputTargetRect(
+                    &processor,
+                    true,
+                    Some(&dest_rect),
+                );
             }
 
             Ok(Self {
@@ -588,8 +634,9 @@ mod wgc {
                     Some(&mut input_view),
                 )?;
             }
-            let input_view = input_view
-                .ok_or_else(|| crate::d3d_none_error("D3D11 object creation returned None"))?;
+            let input_view = input_view.ok_or_else(|| {
+                crate::d3d_none_error("D3D11 object creation returned None")
+            })?;
 
             let mut stream = D3D11_VIDEO_PROCESSOR_STREAM::default();
             stream.Enable = true.into();
@@ -636,19 +683,31 @@ mod wgc {
                     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
 
                     let map_result = unsafe {
-                        job.context
-                            .0
-                            .Map(&job.texture.0, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                        job.context.0.Map(
+                            &job.texture.0,
+                            0,
+                            D3D11_MAP_READ,
+                            0,
+                            Some(&mut mapped),
+                        )
                     };
 
                     if map_result.is_ok() && !mapped.pData.is_null() {
                         let row_pitch = mapped.RowPitch as usize;
                         let mapped_len = row_pitch.saturating_mul(job.height as usize);
                         let bytes = unsafe {
-                            std::slice::from_raw_parts(mapped.pData.cast::<u8>(), mapped_len)
+                            std::slice::from_raw_parts(
+                                mapped.pData.cast::<u8>(),
+                                mapped_len,
+                            )
                         };
 
-                        let packed = pack_pitched_rgba(bytes, row_pitch, job.width, job.height);
+                        let packed = pack_pitched_rgba(
+                            bytes,
+                            row_pitch,
+                            job.width,
+                            job.height,
+                        );
 
                         unsafe {
                             job.context.0.Unmap(&job.texture.0, 0);
@@ -674,7 +733,8 @@ mod wgc {
                                         stats.gpu_to_cpu_ms_avg * 0.9 + elapsed_ms * 0.1;
                                 }
 
-                                stats.gpu_to_cpu_ms_max = stats.gpu_to_cpu_ms_max.max(elapsed_ms);
+                                stats.gpu_to_cpu_ms_max =
+                                    stats.gpu_to_cpu_ms_max.max(elapsed_ms);
                             }
                         }
                     }
@@ -705,7 +765,8 @@ mod wgc {
         fps_window_frames: u64,
         last_preview_sent: Instant,
         preview_job_tx: crossbeam_channel::Sender<PreviewReadbackJob>,
-        preview_recycle_rx: crossbeam_channel::Receiver<SendDirectX<ID3D11Texture2D>>,
+        preview_recycle_rx:
+            crossbeam_channel::Receiver<SendDirectX<ID3D11Texture2D>>,
         preview_free_textures: Vec<SendDirectX<ID3D11Texture2D>>,
         preview_allocated_textures: usize,
         preview_scaler: Option<GpuPreviewScaler>,
@@ -722,10 +783,11 @@ mod wgc {
         type Error = HandlerError;
 
         fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
-            let (preview_job_tx, preview_recycle_rx) = spawn_preview_readback_worker(
-                ctx.flags.preview_queue.clone(),
-                Arc::clone(&ctx.flags.stats),
-            );
+            let (preview_job_tx, preview_recycle_rx) =
+                spawn_preview_readback_worker(
+                    ctx.flags.preview_queue.clone(),
+                    Arc::clone(&ctx.flags.stats),
+                );
 
             Ok(Self {
                 stats: ctx.flags.stats,
@@ -793,8 +855,7 @@ mod wgc {
                                 }
                                 Err(err) => {
                                     if let Ok(mut status) = self.gpu_status.lock() {
-                                        *status =
-                                            super::GpuRecordingStatus::Failed(err.to_string());
+                                        *status = super::GpuRecordingStatus::Failed(err.to_string());
                                     }
                                 }
                             }
@@ -844,7 +905,9 @@ mod wgc {
                 // Immediate D3D11 context is shared with a worker only after
                 // enabling the built-in multithread protection layer.
                 if !self.d3d_multithread_enabled {
-                    if let Ok(multithread) = frame.device_context().cast::<ID3D11Multithread>() {
+                    if let Ok(multithread) =
+                        frame.device_context().cast::<ID3D11Multithread>()
+                    {
                         unsafe {
                             let _ = multithread.SetMultithreadProtected(true);
                         }
@@ -858,7 +921,9 @@ mod wgc {
                     let rebuild_scaler = self
                         .preview_scaler
                         .as_ref()
-                        .is_none_or(|scaler| !scaler.matches(frame, preview_w, preview_h));
+                        .is_none_or(|scaler| {
+                            !scaler.matches(frame, preview_w, preview_h)
+                        });
 
                     if rebuild_scaler {
                         self.preview_scaler =
@@ -901,9 +966,10 @@ mod wgc {
                         // Only the 960x540 (or smaller) GPU result is copied to
                         // CPU-readable staging memory.
                         unsafe {
-                            frame
-                                .device_context()
-                                .CopyResource(&staging.0, scaled_texture);
+                            frame.device_context().CopyResource(
+                                &staging.0,
+                                scaled_texture,
+                            );
                         }
 
                         let job = PreviewReadbackJob {
@@ -935,7 +1001,8 @@ mod wgc {
                         }
                     }
                 } else if let Ok(mut stats) = self.stats.lock() {
-                    stats.preview_jobs_dropped = stats.preview_jobs_dropped.saturating_add(1);
+                    stats.preview_jobs_dropped =
+                        stats.preview_jobs_dropped.saturating_add(1);
                 }
             }
 
@@ -951,6 +1018,7 @@ mod wgc {
                 }
                 self.fps_window_started = Instant::now();
                 self.fps_window_frames = 0;
+
             }
 
             Ok(())
@@ -962,7 +1030,8 @@ mod wgc {
     }
 
     pub fn enumerate_windows() -> Result<Vec<WindowInfo>, CaptureError> {
-        let windows = Window::enumerate().map_err(|e| CaptureError::Backend(e.to_string()))?;
+        let windows = Window::enumerate()
+            .map_err(|e| CaptureError::Backend(e.to_string()))?;
 
         let mut result = Vec::new();
 
@@ -991,10 +1060,7 @@ mod wgc {
         Ok(result)
     }
 
-    pub fn start_worker(
-        source: CaptureSource,
-        target_fps: u32,
-    ) -> Result<CaptureWorker, CaptureError> {
+    pub fn start_worker(source: CaptureSource, target_fps: u32) -> Result<CaptureWorker, CaptureError> {
         let preview_queue = FrameQueue::new(2);
         let stats = Arc::new(Mutex::new(super::CaptureStats::default()));
 
@@ -1021,8 +1087,8 @@ mod wgc {
 
         let control = match source {
             CaptureSource::Desktop => {
-                let monitor =
-                    Monitor::primary().map_err(|e| CaptureError::Backend(e.to_string()))?;
+                let monitor = Monitor::primary()
+                    .map_err(|e| CaptureError::Backend(e.to_string()))?;
 
                 let settings = Settings::new(
                     monitor,

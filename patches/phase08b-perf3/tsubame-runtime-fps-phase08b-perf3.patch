@@ -1,0 +1,272 @@
+--- a/apps/tsubame/src/app.rs
++++ b/apps/tsubame/src/app.rs
+@@ -15,7 +15,10 @@
+     collections::HashMap,
+     fs,
+     path::PathBuf,
+-    sync::{mpsc, Arc, Mutex, RwLock},
++    sync::{
++        atomic::{AtomicU64, Ordering},
++        mpsc, Arc, Mutex, RwLock,
++    },
+     time::{Duration, Instant},
+ };
+ use stream_audio::{
+@@ -293,6 +296,50 @@
+     }
+ }
+ 
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
++struct RuntimeFrameCountSnapshot {
++    preview_ui_frames: u64,
++    mixer_ui_frames: u64,
++    streaming_output_frames: u64,
++}
++
++#[derive(Debug, Default)]
++struct RuntimeFrameCounters {
++    preview_ui_frames: AtomicU64,
++    mixer_ui_frames: AtomicU64,
++    streaming_output_frames: AtomicU64,
++}
++
++impl RuntimeFrameCounters {
++    fn snapshot(&self) -> RuntimeFrameCountSnapshot {
++        RuntimeFrameCountSnapshot {
++            preview_ui_frames: self.preview_ui_frames.load(Ordering::Relaxed),
++            mixer_ui_frames: self.mixer_ui_frames.load(Ordering::Relaxed),
++            streaming_output_frames: self.streaming_output_frames.load(Ordering::Relaxed),
++        }
++    }
++
++    fn count_preview_ui_frame(&self) {
++        self.preview_ui_frames.fetch_add(1, Ordering::Relaxed);
++    }
++
++    fn count_mixer_ui_frame(&self) {
++        self.mixer_ui_frames.fetch_add(1, Ordering::Relaxed);
++    }
++
++    fn count_streaming_output_frame(&self) {
++        self.streaming_output_frames.fetch_add(1, Ordering::Relaxed);
++    }
++}
++
++fn measured_fps(current: u64, previous: u64, elapsed: Duration) -> f32 {
++    let seconds = elapsed.as_secs_f32();
++    if seconds <= f32::EPSILON {
++        return 0.0;
++    }
++    current.saturating_sub(previous) as f32 / seconds
++}
++
+ #[derive(Debug)]
+ struct PerformanceMonitor {
+     system: System,
+@@ -300,26 +347,70 @@
+     last_refresh: Instant,
+     cpu_percent: f32,
+     memory_mb: f64,
++    preview_fps: f32,
++    mixer_ui_fps: f32,
++    output_fps: f32,
++    last_runtime_counts: RuntimeFrameCountSnapshot,
++    last_recording_encoded_frames: Option<u64>,
+ }
+ 
+ impl PerformanceMonitor {
+     fn new() -> Self {
+-        let mut monitor = Self {
++        Self {
+             system: System::new(),
+             pid: sysinfo::get_current_pid().ok(),
+             last_refresh: Instant::now() - Duration::from_secs(2),
+             cpu_percent: 0.0,
+             memory_mb: 0.0,
+-        };
+-        monitor.refresh_if_due();
+-        monitor
++            preview_fps: 0.0,
++            mixer_ui_fps: 0.0,
++            output_fps: 0.0,
++            last_runtime_counts: RuntimeFrameCountSnapshot::default(),
++            last_recording_encoded_frames: None,
++        }
+     }
+ 
+-    fn refresh_if_due(&mut self) {
+-        if self.last_refresh.elapsed() < Duration::from_secs(1) {
++    fn refresh_if_due(
++        &mut self,
++        counters: &RuntimeFrameCounters,
++        recording_encoded_frames: Option<u64>,
++        streaming_active: bool,
++    ) {
++        let elapsed = self.last_refresh.elapsed();
++        if elapsed < Duration::from_secs(1) {
+             return;
+         }
+ 
++        let current_counts = counters.snapshot();
++        self.preview_fps = measured_fps(
++            current_counts.preview_ui_frames,
++            self.last_runtime_counts.preview_ui_frames,
++            elapsed,
++        );
++        self.mixer_ui_fps = measured_fps(
++            current_counts.mixer_ui_frames,
++            self.last_runtime_counts.mixer_ui_frames,
++            elapsed,
++        );
++
++        let streaming_output_fps = measured_fps(
++            current_counts.streaming_output_frames,
++            self.last_runtime_counts.streaming_output_frames,
++            elapsed,
++        );
++        self.output_fps = if streaming_active {
++            streaming_output_fps
++        } else if let Some(current_recording_frames) = recording_encoded_frames {
++            self.last_recording_encoded_frames
++                .map(|previous| measured_fps(current_recording_frames, previous, elapsed))
++                .unwrap_or(0.0)
++        } else {
++            0.0
++        };
++
++        self.last_runtime_counts = current_counts;
++        self.last_recording_encoded_frames = recording_encoded_frames;
++
+         // Phase 9.4.4: 1秒周期に制限し、監視処理自身が配信負荷へ
+         // 影響しすぎないようにする。
+         self.system.refresh_all();
+@@ -1445,6 +1536,7 @@
+     streaming: Option<StreamingSession>,
+     streaming_message: String,
+     performance: PerformanceMonitor,
++    runtime_frame_counters: Arc<RuntimeFrameCounters>,
+     settings_open: bool,
+     settings_page: SettingsPage,
+     addon_registry: AddonRegistry,
+@@ -1723,6 +1815,7 @@
+             ..DeferredMixerUiState::default()
+         }));
+         let (mixer_command_tx, mixer_command_rx) = mpsc::channel();
++        let runtime_frame_counters = Arc::new(RuntimeFrameCounters::default());
+ 
+         Self {
+             vm,
+@@ -1785,6 +1878,7 @@
+             streaming: None,
+             streaming_message: "配信: 待機中".to_owned(),
+             performance: PerformanceMonitor::new(),
++            runtime_frame_counters,
+             settings_open: false,
+             settings_page: SettingsPage::General,
+             addon_registry: AddonRegistry::new(),
+@@ -2203,6 +2297,7 @@
+         }
+         if let Some(streaming) = &self.streaming {
+             streaming.push_video_frame(&composed_frame);
++            self.runtime_frame_counters.count_streaming_output_frame();
+         }
+     }
+ 
+@@ -2561,8 +2656,10 @@
+         let snapshot = Arc::clone(&self.mixer_snapshot);
+         let ui_state = Arc::clone(&self.mixer_ui_state);
+         let command_tx = self.mixer_command_tx.clone();
++        let runtime_frame_counters = Arc::clone(&self.runtime_frame_counters);
+ 
+         ctx.show_viewport_deferred(viewport_id, builder, move |mixer_ctx, _class| {
++            runtime_frame_counters.count_mixer_ui_frame();
+             let viewport_info = mixer_ctx.input(|input| input.viewport().clone());
+             if viewport_info.close_requested() {
+                 send_mixer_command(mixer_ctx, &command_tx, MixerViewportCommand::Close);
+@@ -2651,8 +2748,10 @@
+         let snapshot = Arc::clone(&self.preview_snapshot);
+         let ui_state = Arc::clone(&self.preview_ui_state);
+         let command_tx = self.preview_command_tx.clone();
++        let runtime_frame_counters = Arc::clone(&self.runtime_frame_counters);
+ 
+         ctx.show_viewport_deferred(viewport_id, builder, move |preview_ctx, _class| {
++            runtime_frame_counters.count_preview_ui_frame();
+             let viewport_info = preview_ctx.input(|input| input.viewport().clone());
+             if viewport_info.close_requested() {
+                 send_preview_command(preview_ctx, &command_tx, PreviewViewportCommand::Close);
+@@ -2886,7 +2985,17 @@
+         self.bgm_players.retain(|_, player| !player.is_finished());
+         self.poll_recording_finalize();
+         self.poll_streaming();
+-        self.performance.refresh_if_due();
++        let recording_encoded_frames = self
++            .recording
++            .as_ref()
++            .map(|recording| recording.encoded_frames());
++        let streaming_active = self.streaming.is_some();
++        let runtime_frame_counters = Arc::clone(&self.runtime_frame_counters);
++        self.performance.refresh_if_due(
++            runtime_frame_counters.as_ref(),
++            recording_encoded_frames,
++            streaming_active,
++        );
+         self.sync_capture_preview_mode();
+         self.sync_preview_dimensions_from_latest();
+         self.push_streaming_frame_if_available();
+@@ -2971,10 +3080,13 @@
+                     })
+                     .unwrap_or((0.0, 0));
+                 ui.label(format!(
+-                    "CPU {:.1}% | RAM {:.0} MB | Capture {:.1} FPS | Preview Drop {}",
++                    "CPU {:.1}% | RAM {:.0} MB | Capture {:.1} FPS | Preview {:.1} FPS | Mixer UI {:.1} FPS | Output {:.1} FPS | Drop {}",
+                     self.performance.cpu_percent,
+                     self.performance.memory_mb,
+                     capture_fps,
++                    self.performance.preview_fps,
++                    self.performance.mixer_ui_fps,
++                    self.performance.output_fps,
+                     preview_drops
+                 ));
+                 ui.separator();
+@@ -3564,7 +3676,11 @@
+ 
+ #[cfg(test)]
+ mod toolbar_tests {
+-    use super::{main_ui_repaint_ms, mixer_ui_repaint_ms, toggle_window_open};
++    use super::{
++        main_ui_repaint_ms, measured_fps, mixer_ui_repaint_ms, toggle_window_open,
++        RuntimeFrameCounters,
++    };
++    use std::time::Duration;
+     use stream_capture::PreviewMode;
+ 
+     #[test]
+@@ -3594,6 +3710,28 @@
+     }
+ 
+     #[test]
++    fn measured_fps_uses_actual_elapsed_time() {
++        let fps = measured_fps(45, 15, Duration::from_millis(1500));
++        assert!((fps - 20.0).abs() < 0.001);
++    }
++
++    #[test]
++    fn runtime_frame_counters_track_each_pipeline_independently() {
++        let counters = RuntimeFrameCounters::default();
++        counters.count_preview_ui_frame();
++        counters.count_preview_ui_frame();
++        counters.count_mixer_ui_frame();
++        counters.count_streaming_output_frame();
++        counters.count_streaming_output_frame();
++        counters.count_streaming_output_frame();
++
++        let snapshot = counters.snapshot();
++        assert_eq!(snapshot.preview_ui_frames, 2);
++        assert_eq!(snapshot.mixer_ui_frames, 1);
++        assert_eq!(snapshot.streaming_output_frames, 3);
++    }
++
++    #[test]
+     fn audio_worker_can_be_shared_with_deferred_mixer() {
+         fn assert_send_sync<T: Send + Sync>() {}
+         assert_send_sync::<stream_audio::AudioWorker>();

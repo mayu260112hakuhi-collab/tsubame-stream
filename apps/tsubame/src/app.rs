@@ -1,7 +1,9 @@
 use crate::addon::{AddonOrigin, AddonRegistry, ADDON_API_VERSION};
 use crate::bgm::{BgmLayerSource, BgmPlayer};
 use crate::scene::{ImageOverlaySource, LayerId, LayerKind, OverlaySource, SceneLayer};
-use crate::settings::{load_settings, save_settings, AppSettings};
+use crate::settings::{
+    load_settings, sanitize_window_position, sanitize_window_size, save_settings, AppSettings,
+};
 use crate::streaming::{StreamingPlatform, StreamingSession, StreamingTargetConfig};
 use crate::ui_layout::{
     compact_source_name, normal_preview_size, METER_GREEN_END_DB, METER_ORANGE_END_DB,
@@ -13,14 +15,19 @@ use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
-    sync::mpsc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc, Mutex, RwLock,
+    },
     time::{Duration, Instant},
 };
 use stream_audio::{
-    application_source_label, dbfs, selection_label, AudioChannelKind, AudioDeviceSelection,
-    AudioWorker, ChannelMixerControl, MixerControl,
+    application_source_label, dbfs, selection_label, AudioChannelId, AudioChannelKind,
+    AudioDeviceSelection, AudioWorker, ChannelMixerControl, ExternalPcmSender, MixerControl,
 };
-use stream_capture::{enumerate_windows, CaptureSource, CaptureWorker, PreviewMode, WindowInfo};
+use stream_capture::{
+    enumerate_windows, CaptureSource, CaptureWorker, LatestFrameSnapshot, PreviewMode, WindowInfo,
+};
 use stream_core::{MarkerKind, StreamPreset};
 use stream_recording::{
     ffmpeg_location_string, EncoderPreference, RecordingConfig, RecordingPaths, RecordingSession,
@@ -289,6 +296,78 @@ fn draw_mixer_channel_strip(ui: &mut egui::Ui, model: MixerStripModel) -> MixerS
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RuntimeFrameCountSnapshot {
+    preview_ui_frames: u64,
+    mixer_ui_frames: u64,
+    mixer_meter_updates: u64,
+    streaming_output_frames: u64,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeFrameCounters {
+    preview_ui_frames: AtomicU64,
+    mixer_ui_frames: AtomicU64,
+    mixer_meter_updates: AtomicU64,
+    streaming_output_frames: AtomicU64,
+}
+
+impl RuntimeFrameCounters {
+    fn snapshot(&self) -> RuntimeFrameCountSnapshot {
+        RuntimeFrameCountSnapshot {
+            preview_ui_frames: self.preview_ui_frames.load(Ordering::Relaxed),
+            mixer_ui_frames: self.mixer_ui_frames.load(Ordering::Relaxed),
+            mixer_meter_updates: self.mixer_meter_updates.load(Ordering::Relaxed),
+            streaming_output_frames: self.streaming_output_frames.load(Ordering::Relaxed),
+        }
+    }
+
+    fn count_preview_ui_frame(&self) {
+        self.preview_ui_frames.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn count_mixer_ui_frame(&self) {
+        self.mixer_ui_frames.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn count_mixer_meter_update(&self) {
+        self.mixer_meter_updates.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn count_streaming_output_frame(&self) {
+        self.streaming_output_frames.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn measured_fps(current: u64, previous: u64, elapsed: Duration) -> f32 {
+    let seconds = elapsed.as_secs_f32();
+    if seconds <= f32::EPSILON {
+        return 0.0;
+    }
+    current.saturating_sub(previous) as f32 / seconds
+}
+
+fn mixer_meter_refresh_due(last_refresh: Option<Instant>, now: Instant) -> bool {
+    last_refresh
+        .map(|last| now.saturating_duration_since(last) >= Duration::from_millis(33))
+        .unwrap_or(true)
+}
+
+fn performance_pipeline_text(
+    capture_fps: f32,
+    preview_fps: f32,
+    mixer_render_fps: f32,
+    mixer_meter_fps: f32,
+    encode_input_fps: f32,
+    target_fps: u32,
+    drops: u64,
+) -> String {
+    format!(
+        "Capture {:.1} FPS | Preview {:.1} FPS | Mixer Render {:.1} FPS | Meter {:.1} FPS | Encode In {:.1} FPS | Target {} FPS | Drop {}",
+        capture_fps, preview_fps, mixer_render_fps, mixer_meter_fps, encode_input_fps, target_fps, drops
+    )
+}
+
 #[derive(Debug)]
 struct PerformanceMonitor {
     system: System,
@@ -296,25 +375,76 @@ struct PerformanceMonitor {
     last_refresh: Instant,
     cpu_percent: f32,
     memory_mb: f64,
+    preview_fps: f32,
+    mixer_ui_fps: f32,
+    mixer_meter_fps: f32,
+    encode_input_fps: f32,
+    last_runtime_counts: RuntimeFrameCountSnapshot,
+    last_recording_encoded_frames: Option<u64>,
 }
 
 impl PerformanceMonitor {
     fn new() -> Self {
-        let mut monitor = Self {
+        Self {
             system: System::new(),
             pid: sysinfo::get_current_pid().ok(),
             last_refresh: Instant::now() - Duration::from_secs(2),
             cpu_percent: 0.0,
             memory_mb: 0.0,
-        };
-        monitor.refresh_if_due();
-        monitor
+            preview_fps: 0.0,
+            mixer_ui_fps: 0.0,
+            mixer_meter_fps: 0.0,
+            encode_input_fps: 0.0,
+            last_runtime_counts: RuntimeFrameCountSnapshot::default(),
+            last_recording_encoded_frames: None,
+        }
     }
 
-    fn refresh_if_due(&mut self) {
-        if self.last_refresh.elapsed() < Duration::from_secs(1) {
+    fn refresh_if_due(
+        &mut self,
+        counters: &RuntimeFrameCounters,
+        recording_encoded_frames: Option<u64>,
+        streaming_active: bool,
+    ) {
+        let elapsed = self.last_refresh.elapsed();
+        if elapsed < Duration::from_secs(1) {
             return;
         }
+
+        let current_counts = counters.snapshot();
+        self.preview_fps = measured_fps(
+            current_counts.preview_ui_frames,
+            self.last_runtime_counts.preview_ui_frames,
+            elapsed,
+        );
+        self.mixer_ui_fps = measured_fps(
+            current_counts.mixer_ui_frames,
+            self.last_runtime_counts.mixer_ui_frames,
+            elapsed,
+        );
+        self.mixer_meter_fps = measured_fps(
+            current_counts.mixer_meter_updates,
+            self.last_runtime_counts.mixer_meter_updates,
+            elapsed,
+        );
+
+        let streaming_output_fps = measured_fps(
+            current_counts.streaming_output_frames,
+            self.last_runtime_counts.streaming_output_frames,
+            elapsed,
+        );
+        self.encode_input_fps = if streaming_active {
+            streaming_output_fps
+        } else if let Some(current_recording_frames) = recording_encoded_frames {
+            self.last_recording_encoded_frames
+                .map(|previous| measured_fps(current_recording_frames, previous, elapsed))
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+
+        self.last_runtime_counts = current_counts;
+        self.last_recording_encoded_frames = recording_encoded_frames;
 
         // Phase 9.4.4: 1秒周期に制限し、監視処理自身が配信負荷へ
         // 影響しすぎないようにする。
@@ -436,6 +566,1001 @@ fn scan_bgm_library(root: &std::path::Path) -> Vec<PathBuf> {
     files
 }
 
+
+#[derive(Clone)]
+struct PreviewRenderSnapshot {
+    layers: Vec<SceneLayer>,
+    overlay_source: OverlaySource,
+    image_overlays: Vec<(LayerId, ImageOverlaySource)>,
+    selected_layer: Option<LayerId>,
+    fish_layer_id: LayerId,
+    app_started_at: Instant,
+}
+
+impl PreviewRenderSnapshot {
+    fn layer_locked(&self, id: LayerId) -> bool {
+        self.layers
+            .iter()
+            .find(|layer| layer.id == id)
+            .map(|layer| layer.locked)
+            .unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PreviewViewportCommand {
+    Close,
+    Geometry {
+        position: Option<[f32; 2]>,
+        size: Option<[f32; 2]>,
+    },
+    Select(Option<LayerId>),
+    Move {
+        layer_id: LayerId,
+        delta_x: f32,
+        delta_y: f32,
+        preview_width: f32,
+        preview_height: f32,
+        source_width: u32,
+        source_height: u32,
+    },
+    Resize {
+        layer_id: LayerId,
+        delta_x: f32,
+        preview_width: f32,
+        source_width: u32,
+        source_height: u32,
+    },
+}
+
+#[derive(Default)]
+struct DeferredPreviewUiState {
+    texture: Option<egui::TextureHandle>,
+    resize_drag_layer: Option<LayerId>,
+    last_window_position: Option<[f32; 2]>,
+    last_window_size: Option<[f32; 2]>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MixerRenderSnapshot {
+    bgm_rows: Vec<(LayerId, Option<AudioChannelId>, String, f32, bool)>,
+    device_switch_enabled: bool,
+    device_switch_reason: Option<String>,
+}
+
+#[derive(Debug)]
+enum MixerViewportCommand {
+    Close,
+    Geometry {
+        position: Option<[f32; 2]>,
+        size: Option<[f32; 2]>,
+    },
+    BgmGain {
+        layer_id: LayerId,
+        gain_percent: f32,
+    },
+    BgmMute {
+        layer_id: LayerId,
+        muted: bool,
+    },
+    RemoveBgm {
+        layer_id: LayerId,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+struct MixerMeterSnapshot {
+    desktop: f32,
+    mic: f32,
+    mix: f32,
+    application_levels: HashMap<u64, f32>,
+}
+
+#[derive(Debug, Clone)]
+struct DeferredMixerUiState {
+    selected_application_audio_pid: Option<u32>,
+    application_audio_message: String,
+    audio_message: String,
+    meter_snapshot: MixerMeterSnapshot,
+    last_meter_refresh: Option<Instant>,
+    last_window_position: Option<[f32; 2]>,
+    last_window_size: Option<[f32; 2]>,
+}
+
+impl Default for DeferredMixerUiState {
+    fn default() -> Self {
+        Self {
+            selected_application_audio_pid: None,
+            application_audio_message: "アプリ音声: 一覧から選択してください".to_owned(),
+            audio_message: "WASAPI音声メーター: 初期化中".to_owned(),
+            meter_snapshot: MixerMeterSnapshot::default(),
+            last_meter_refresh: None,
+            last_window_position: None,
+            last_window_size: None,
+        }
+    }
+}
+
+fn mixer_ui_repaint_ms(open: bool) -> u64 {
+    if open {
+        33
+    } else {
+        250
+    }
+}
+
+fn send_mixer_command(
+    ctx: &egui::Context,
+    tx: &mpsc::Sender<MixerViewportCommand>,
+    command: MixerViewportCommand,
+) {
+    if tx.send(command).is_ok() {
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
+}
+
+fn main_ui_repaint_ms(
+    streaming: bool,
+    _preview_open: bool,
+    recording: bool,
+    recording_preview_mode: PreviewMode,
+) -> u64 {
+    if streaming {
+        // Streaming still pushes CPU-readable preview frames from the app loop.
+        // The streaming path will be detached from the UI in a later perf phase.
+        33
+    } else if recording {
+        match recording_preview_mode {
+            PreviewMode::Fps30 => 33,
+            PreviewMode::Fps15 => 66,
+            PreviewMode::Off => 250,
+        }
+    } else {
+        // Deferred preview viewports repaint themselves. An open preview must
+        // not force the main control surface to 30 FPS anymore.
+        100
+    }
+}
+
+fn compose_preview_frame(
+    frame: stream_capture::CaptureFrame,
+    snapshot: &PreviewRenderSnapshot,
+) -> stream_capture::CaptureFrame {
+    let overlay_enabled = snapshot.layers.iter().any(|layer| match layer.kind {
+        LayerKind::FishOverlay if layer.id == snapshot.fish_layer_id => {
+            snapshot.overlay_source.enabled
+        }
+        LayerKind::Image => snapshot
+            .image_overlays
+            .iter()
+            .find(|(id, _)| *id == layer.id)
+            .is_some_and(|(_, overlay)| overlay.enabled),
+        _ => false,
+    });
+
+    if !overlay_enabled {
+        return frame;
+    }
+
+    let mut composed_rgba = frame.rgba.to_vec();
+    for layer in &snapshot.layers {
+        match layer.kind {
+            LayerKind::FishOverlay if layer.id == snapshot.fish_layer_id => {
+                snapshot.overlay_source.compose_test_overlay(
+                    &mut composed_rgba,
+                    frame.width,
+                    frame.height,
+                    snapshot.app_started_at.elapsed().as_secs_f32(),
+                );
+            }
+            LayerKind::Image => {
+                if let Some((_, image_overlay)) = snapshot
+                    .image_overlays
+                    .iter()
+                    .find(|(id, _)| *id == layer.id)
+                {
+                    image_overlay.compose(&mut composed_rgba, frame.width, frame.height);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    stream_capture::CaptureFrame {
+        sequence: frame.sequence,
+        width: frame.width,
+        height: frame.height,
+        rgba: Arc::<[u8]>::from(composed_rgba),
+    }
+}
+
+fn send_preview_command(
+    ctx: &egui::Context,
+    tx: &mpsc::Sender<PreviewViewportCommand>,
+    command: PreviewViewportCommand,
+) {
+    if tx.send(command).is_ok() {
+        ctx.request_repaint_of(egui::ViewportId::ROOT);
+    }
+}
+
+fn geometry_changed(a: Option<[f32; 2]>, b: Option<[f32; 2]>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => (a[0] - b[0]).abs() > 0.5 || (a[1] - b[1]).abs() > 0.5,
+        (None, None) => false,
+        _ => true,
+    }
+}
+
+fn draw_deferred_preview_canvas(
+    preview_ctx: &egui::Context,
+    ui: &mut egui::Ui,
+    outer_size: egui::Vec2,
+    snapshot: &PreviewRenderSnapshot,
+    latest_frame: Option<&stream_capture::LatestFrameSnapshot>,
+    streamed_frame: Option<&Arc<RwLock<Option<stream_capture::CaptureFrame>>>>,
+    ui_state: &Arc<Mutex<DeferredPreviewUiState>>,
+    command_tx: &mpsc::Sender<PreviewViewportCommand>,
+) {
+    let desired = egui::vec2(outer_size.x.max(120.0), outer_size.y.max(120.0));
+    let (outer, outer_response) = ui.allocate_exact_size(desired, egui::Sense::click());
+    ui.painter()
+        .rect_filled(outer, 4.0, egui::Color32::from_rgb(18, 20, 24));
+
+    // While streaming, reuse the exact composited frame already sent to the
+    // streamer. That keeps deferred preview from compositing overlays a second
+    // time at 30 FPS. Outside streaming, compose from the non-consuming latest
+    // capture snapshot so the main UI can remain asleep.
+    let streamed = streamed_frame.and_then(|shared| {
+        shared
+            .read()
+            .ok()
+            .and_then(|frame| frame.as_ref().cloned())
+    });
+    let composed_frame = if let Some(frame) = streamed {
+        frame
+    } else {
+        let Some(frame) = latest_frame.and_then(|latest| latest.latest_frame()) else {
+            ui.painter().text(
+                outer.center(),
+                egui::Align2::CENTER_CENTER,
+                "キャプチャ待機中…",
+                egui::FontId::proportional(16.0),
+                egui::Color32::LIGHT_GRAY,
+            );
+            return;
+        };
+        compose_preview_frame(frame, snapshot)
+    };
+
+    let source_size = [composed_frame.width, composed_frame.height];
+    let image = egui::ColorImage::from_rgba_unmultiplied(
+        [composed_frame.width as usize, composed_frame.height as usize],
+        &composed_frame.rgba,
+    );
+
+    let texture_id = {
+        let Ok(mut state) = ui_state.lock() else {
+            return;
+        };
+        if let Some(texture) = &mut state.texture {
+            texture.set(image, egui::TextureOptions::LINEAR);
+        } else {
+            state.texture = Some(preview_ctx.load_texture(
+                "capture-preview-deferred",
+                image,
+                egui::TextureOptions::LINEAR,
+            ));
+        }
+        state.texture.as_ref().map(|texture| texture.id())
+    };
+
+    let Some(texture_id) = texture_id else {
+        return;
+    };
+
+    let (draw_w, draw_h) = fit_aspect(
+        source_size[0] as f32,
+        source_size[1] as f32,
+        outer.width(),
+        outer.height(),
+    );
+    let image_rect = egui::Rect::from_center_size(outer.center(), egui::vec2(draw_w, draw_h));
+    ui.painter().image(
+        texture_id,
+        image_rect,
+        egui::Rect::from_min_max(egui::Pos2::new(0.0, 0.0), egui::Pos2::new(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+
+    let mut overlay_interacted = false;
+
+    if snapshot.overlay_source.enabled && source_size[0] > 0 && source_size[1] > 0 {
+        let fish_locked = snapshot.layer_locked(snapshot.fish_layer_id);
+        let fish_w = image_rect.width() * snapshot.overlay_source.width_percent / 100.0;
+        let fish_h = fish_w * 0.42;
+        let bounce = if snapshot.overlay_source.bounce {
+            (snapshot.app_started_at.elapsed().as_secs_f32() * 4.2)
+                .sin()
+                .abs()
+                * image_rect.height()
+                * 0.055
+        } else {
+            0.0
+        };
+        let center = egui::pos2(
+            image_rect.left() + image_rect.width() * snapshot.overlay_source.x_percent / 100.0,
+            image_rect.top() + image_rect.height() * snapshot.overlay_source.y_percent / 100.0
+                - bounce,
+        );
+        let fish_rect = egui::Rect::from_center_size(center, egui::vec2(fish_w, fish_h));
+        let hit_rect = fish_rect.expand(5.0).intersect(image_rect);
+        let fish_response = ui.interact(
+            hit_rect,
+            ui.id().with("overlay_fish_drag_deferred"),
+            egui::Sense::click_and_drag(),
+        );
+        let handle_size = 12.0;
+        let handle_rect = egui::Rect::from_center_size(
+            fish_rect.right_bottom(),
+            egui::vec2(handle_size, handle_size),
+        );
+
+        if fish_response.clicked() {
+            overlay_interacted = true;
+            send_preview_command(
+                preview_ctx,
+                command_tx,
+                PreviewViewportCommand::Select(Some(snapshot.fish_layer_id)),
+            );
+        }
+        if fish_response.drag_started() {
+            overlay_interacted = true;
+            let resize = !fish_locked
+                && preview_ctx
+                    .pointer_interact_pos()
+                    .map(|p| handle_rect.expand(5.0).contains(p))
+                    .unwrap_or(false);
+            if let Ok(mut state) = ui_state.lock() {
+                state.resize_drag_layer = resize.then_some(snapshot.fish_layer_id);
+            }
+            send_preview_command(
+                preview_ctx,
+                command_tx,
+                PreviewViewportCommand::Select(Some(snapshot.fish_layer_id)),
+            );
+        }
+        if fish_response.dragged() {
+            overlay_interacted = true;
+            if !fish_locked {
+                let delta = preview_ctx.input(|i| i.pointer.delta());
+                let resize = ui_state
+                    .lock()
+                    .ok()
+                    .and_then(|state| state.resize_drag_layer)
+                    == Some(snapshot.fish_layer_id);
+                let command = if resize {
+                    PreviewViewportCommand::Resize {
+                        layer_id: snapshot.fish_layer_id,
+                        delta_x: delta.x,
+                        preview_width: image_rect.width(),
+                        source_width: source_size[0],
+                        source_height: source_size[1],
+                    }
+                } else {
+                    PreviewViewportCommand::Move {
+                        layer_id: snapshot.fish_layer_id,
+                        delta_x: delta.x,
+                        delta_y: delta.y,
+                        preview_width: image_rect.width(),
+                        preview_height: image_rect.height(),
+                        source_width: source_size[0],
+                        source_height: source_size[1],
+                    }
+                };
+                send_preview_command(preview_ctx, command_tx, command);
+            }
+        }
+        if fish_response.drag_stopped() {
+            if let Ok(mut state) = ui_state.lock() {
+                state.resize_drag_layer = None;
+            }
+        }
+
+        if snapshot.selected_layer == Some(snapshot.fish_layer_id) {
+            let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(100, 190, 255));
+            ui.painter()
+                .rect_stroke(fish_rect, 2.0, stroke, egui::StrokeKind::Outside);
+            ui.painter().rect_filled(
+                handle_rect,
+                1.0,
+                egui::Color32::from_rgb(100, 190, 255),
+            );
+        }
+    }
+
+    let image_layer_ids: Vec<LayerId> = snapshot
+        .layers
+        .iter()
+        .rev()
+        .filter(|layer| layer.kind == LayerKind::Image)
+        .map(|layer| layer.id)
+        .collect();
+
+    for image_layer_id in image_layer_ids {
+        let image_locked = snapshot.layer_locked(image_layer_id);
+        let Some((_, image_overlay)) = snapshot
+            .image_overlays
+            .iter()
+            .find(|(id, _)| *id == image_layer_id)
+        else {
+            continue;
+        };
+        if !image_overlay.enabled || source_size[0] == 0 || source_size[1] == 0 {
+            continue;
+        }
+
+        let overlay_w = image_rect.width() * image_overlay.width_percent / 100.0;
+        let overlay_h = overlay_w * image_overlay.aspect();
+        let center = egui::pos2(
+            image_rect.left() + image_rect.width() * image_overlay.x_percent / 100.0,
+            image_rect.top() + image_rect.height() * image_overlay.y_percent / 100.0,
+        );
+        let overlay_rect = egui::Rect::from_center_size(center, egui::vec2(overlay_w, overlay_h));
+        let hit_rect = overlay_rect.expand(5.0).intersect(image_rect);
+        let image_response = ui.interact(
+            hit_rect,
+            ui.id().with(("overlay_image_drag_deferred", image_layer_id)),
+            egui::Sense::click_and_drag(),
+        );
+        let handle_size = 12.0;
+        let handle_rect = egui::Rect::from_center_size(
+            overlay_rect.right_bottom(),
+            egui::vec2(handle_size, handle_size),
+        );
+
+        if image_response.clicked() {
+            overlay_interacted = true;
+            send_preview_command(
+                preview_ctx,
+                command_tx,
+                PreviewViewportCommand::Select(Some(image_layer_id)),
+            );
+        }
+        if image_response.drag_started() {
+            overlay_interacted = true;
+            let resize = !image_locked
+                && preview_ctx
+                    .pointer_interact_pos()
+                    .map(|p| handle_rect.expand(5.0).contains(p))
+                    .unwrap_or(false);
+            if let Ok(mut state) = ui_state.lock() {
+                state.resize_drag_layer = resize.then_some(image_layer_id);
+            }
+            send_preview_command(
+                preview_ctx,
+                command_tx,
+                PreviewViewportCommand::Select(Some(image_layer_id)),
+            );
+        }
+        if image_response.dragged() {
+            overlay_interacted = true;
+            if !image_locked {
+                let delta = preview_ctx.input(|i| i.pointer.delta());
+                let resize = ui_state
+                    .lock()
+                    .ok()
+                    .and_then(|state| state.resize_drag_layer)
+                    == Some(image_layer_id);
+                let command = if resize {
+                    PreviewViewportCommand::Resize {
+                        layer_id: image_layer_id,
+                        delta_x: delta.x,
+                        preview_width: image_rect.width(),
+                        source_width: source_size[0],
+                        source_height: source_size[1],
+                    }
+                } else {
+                    PreviewViewportCommand::Move {
+                        layer_id: image_layer_id,
+                        delta_x: delta.x,
+                        delta_y: delta.y,
+                        preview_width: image_rect.width(),
+                        preview_height: image_rect.height(),
+                        source_width: source_size[0],
+                        source_height: source_size[1],
+                    }
+                };
+                send_preview_command(preview_ctx, command_tx, command);
+            }
+        }
+        if image_response.drag_stopped() {
+            if let Ok(mut state) = ui_state.lock() {
+                state.resize_drag_layer = None;
+            }
+        }
+
+        if snapshot.selected_layer == Some(image_layer_id) {
+            let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(130, 220, 140));
+            ui.painter()
+                .rect_stroke(overlay_rect, 2.0, stroke, egui::StrokeKind::Outside);
+            ui.painter().rect_filled(
+                handle_rect,
+                1.0,
+                egui::Color32::from_rgb(130, 220, 140),
+            );
+        }
+    }
+
+    if outer_response.clicked() && !overlay_interacted {
+        if let Some(pointer) = outer_response.interact_pointer_pos() {
+            if image_rect.contains(pointer) {
+                send_preview_command(
+                    preview_ctx,
+                    command_tx,
+                    PreviewViewportCommand::Select(None),
+                );
+            }
+        }
+    }
+
+    ui.small(format!(
+        "プレビュー別窓 / 入力 {}×{} / 画像・ししゃものドラッグ編集対応",
+        source_size[0], source_size[1]
+    ));
+}
+
+
+fn draw_deferred_audio_mixer(
+    mixer_ctx: &egui::Context,
+    ui: &mut egui::Ui,
+    audio: Option<&Arc<AudioWorker>>,
+    meter_snapshot: &MixerMeterSnapshot,
+    snapshot: &MixerRenderSnapshot,
+    ui_state: &Arc<Mutex<DeferredMixerUiState>>,
+    command_tx: &mpsc::Sender<MixerViewportCommand>,
+) {
+    let desktop_level = meter_snapshot.desktop;
+    let mic_level = meter_snapshot.mic;
+    let mix_level = meter_snapshot.mix;
+    // BGM PCMはまだPhase 8B-Audio前なので実メーターは0.0のまま。
+    // UI状態は親からの軽量スナップショットで受け、操作はコマンドで返す。
+    let bgm_mixer_snapshot = &snapshot.bgm_rows;
+    let mut bgm_mixer_gain_changes: Vec<(LayerId, f32)> = Vec::new();
+    let mut bgm_mixer_mute_changes: Vec<(LayerId, bool)> = Vec::new();
+    let mut bgm_mixer_remove: Option<LayerId> = None;
+
+    if let Some(audio) = audio {
+            let settings = audio.mixer_settings();
+            let output_devices = audio.output_devices();
+            let input_devices = audio.input_devices();
+            let device_switch_enabled = snapshot.device_switch_enabled;
+            let all_channels = audio.audio_channels();
+            let desktop_channel = all_channels
+                .iter()
+                .find(|channel| channel.id == ChannelMixerControl::DESKTOP_ID)
+                .cloned();
+            let microphone_channel = all_channels
+                .iter()
+                .find(|channel| channel.id == ChannelMixerControl::MICROPHONE_ID)
+                .cloned();
+            let application_channels: Vec<_> = all_channels
+                .iter()
+                .filter(|channel| channel.kind == AudioChannelKind::Application)
+                .cloned()
+                .collect();
+
+            // Mixer stripには長いWASAPIステータス文字列をそのまま出さない。
+            // Windows既定を使っている場合は短い「Win規定」に統一して、
+            // PC音声 / マイク / Master の3段目の高さを揃える。
+            let selected_output = audio.selected_output_device();
+            let desktop_source_label = match &selected_output {
+                AudioDeviceSelection::Default => "Win規定".to_owned(),
+                AudioDeviceSelection::DeviceId(_) => compact_source_name(
+                    &selection_label(&selected_output, &output_devices),
+                    10,
+                ),
+            };
+            let selected_input = audio.selected_input_device();
+            let microphone_source_label = match &selected_input {
+                AudioDeviceSelection::Default => "Win規定".to_owned(),
+                AudioDeviceSelection::DeviceId(_) => compact_source_name(
+                    &selection_label(&selected_input, &input_devices),
+                    10,
+                ),
+            };
+
+            ui.small("同一サイズのチャンネルストリップ / PC・マイク・BGM・アプリ音声・Masterを同じ基準で表示します");
+            ui.add_space(4.0);
+
+            let mut remove_channel = None;
+            egui::ScrollArea::horizontal()
+                .id_salt("vertical_audio_mixer_channels")
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+
+                        let desktop_strip = draw_mixer_channel_strip(
+                            ui,
+                            MixerStripModel {
+                                title: "PC音声".to_owned(),
+                                source: desktop_source_label,
+                                level: desktop_level,
+                                gain_percent: settings.desktop_gain * 100.0,
+                                mute: Some(settings.desktop_muted),
+                                mix: desktop_channel.as_ref().map(|c| c.include_in_stream_mix),
+                                wav: desktop_channel.as_ref().map(|c| c.record_individual),
+                                removable: false,
+                            },
+                        );
+                        if desktop_strip.gain_changed {
+                            audio.set_desktop_gain(desktop_strip.gain_percent / 100.0);
+                        }
+                        if desktop_strip.mute != Some(settings.desktop_muted) {
+                            if let Some(muted) = desktop_strip.mute {
+                                audio.set_desktop_muted(muted);
+                            }
+                        }
+                        if let Some(channel) = &desktop_channel {
+                            if desktop_strip.mix != Some(channel.include_in_stream_mix) {
+                                if let Some(in_mix) = desktop_strip.mix {
+                                    audio.set_channel_include_in_stream_mix(channel.id, in_mix);
+                                }
+                            }
+                            if desktop_strip.wav != Some(channel.record_individual) {
+                                if let Some(record) = desktop_strip.wav {
+                                    audio.set_channel_record_individual(channel.id, record);
+                                }
+                            }
+                        }
+
+                        let microphone_strip = draw_mixer_channel_strip(
+                            ui,
+                            MixerStripModel {
+                                title: "マイク".to_owned(),
+                                source: microphone_source_label,
+                                level: mic_level,
+                                gain_percent: settings.mic_gain * 100.0,
+                                mute: Some(settings.mic_muted),
+                                mix: microphone_channel.as_ref().map(|c| c.include_in_stream_mix),
+                                wav: microphone_channel.as_ref().map(|c| c.record_individual),
+                                removable: false,
+                            },
+                        );
+                        if microphone_strip.gain_changed {
+                            audio.set_mic_gain(microphone_strip.gain_percent / 100.0);
+                        }
+                        if microphone_strip.mute != Some(settings.mic_muted) {
+                            if let Some(muted) = microphone_strip.mute {
+                                audio.set_mic_muted(muted);
+                            }
+                        }
+                        if let Some(channel) = &microphone_channel {
+                            if microphone_strip.mix != Some(channel.include_in_stream_mix) {
+                                if let Some(in_mix) = microphone_strip.mix {
+                                    audio.set_channel_include_in_stream_mix(channel.id, in_mix);
+                                }
+                            }
+                            if microphone_strip.wav != Some(channel.record_individual) {
+                                if let Some(record) = microphone_strip.wav {
+                                    audio.set_channel_record_individual(channel.id, record);
+                                }
+                            }
+                        }
+
+                        for (bgm_id, audio_channel_id, bgm_name, volume_percent, muted)
+                            in bgm_mixer_snapshot
+                        {
+                            let bgm_channel = audio_channel_id.and_then(|channel_id| {
+                                all_channels.iter().find(|channel| channel.id == channel_id)
+                            });
+                            let bgm_strip = draw_mixer_channel_strip(
+                                ui,
+                                MixerStripModel {
+                                    title: "BGM".to_owned(),
+                                    source: bgm_name.clone(),
+                                    level: audio_channel_id
+                                        .and_then(|channel_id| {
+                                            meter_snapshot
+                                                .application_levels
+                                                .get(&channel_id)
+                                                .copied()
+                                        })
+                                        .unwrap_or(0.0),
+                                    gain_percent: *volume_percent,
+                                    mute: Some(*muted),
+                                    mix: bgm_channel.map(|channel| channel.include_in_stream_mix),
+                                    wav: bgm_channel.map(|channel| channel.record_individual),
+                                    removable: true,
+                                },
+                            );
+                            if bgm_strip.gain_changed {
+                                bgm_mixer_gain_changes.push((*bgm_id, bgm_strip.gain_percent));
+                            }
+                            if bgm_strip.mute != Some(*muted) {
+                                if let Some(new_muted) = bgm_strip.mute {
+                                    bgm_mixer_mute_changes.push((*bgm_id, new_muted));
+                                }
+                            }
+                            if let Some(channel) = bgm_channel {
+                                if bgm_strip.mix != Some(channel.include_in_stream_mix) {
+                                    if let Some(in_mix) = bgm_strip.mix {
+                                        audio.set_channel_include_in_stream_mix(channel.id, in_mix);
+                                    }
+                                }
+                                if bgm_strip.wav != Some(channel.record_individual) {
+                                    if let Some(record) = bgm_strip.wav {
+                                        audio.set_channel_record_individual(channel.id, record);
+                                    }
+                                }
+                            }
+                            if bgm_strip.remove_clicked {
+                                bgm_mixer_remove = Some(*bgm_id);
+                            }
+                        }
+
+                        for channel in &application_channels {
+                            let source = channel
+                                .process_id
+                                .map(|pid| format!("PID {pid}"))
+                                .unwrap_or_else(|| "アプリ音声".to_owned());
+                            let app_strip = draw_mixer_channel_strip(
+                                ui,
+                                MixerStripModel {
+                                    title: channel.name.clone(),
+                                    source,
+                                    level: meter_snapshot
+                                        .application_levels
+                                        .get(&channel.id)
+                                        .copied()
+                                        .unwrap_or(0.0),
+                                    gain_percent: channel.gain * 100.0,
+                                    mute: Some(channel.muted),
+                                    mix: Some(channel.include_in_stream_mix),
+                                    wav: Some(channel.record_individual),
+                                    removable: true,
+                                },
+                            );
+                            if app_strip.gain_changed {
+                                audio.set_channel_gain(channel.id, app_strip.gain_percent / 100.0);
+                            }
+                            if app_strip.mute != Some(channel.muted) {
+                                if let Some(muted) = app_strip.mute {
+                                    audio.set_channel_muted(channel.id, muted);
+                                }
+                            }
+                            if app_strip.mix != Some(channel.include_in_stream_mix) {
+                                if let Some(in_mix) = app_strip.mix {
+                                    audio.set_channel_include_in_stream_mix(channel.id, in_mix);
+                                }
+                            }
+                            if app_strip.wav != Some(channel.record_individual) {
+                                if let Some(record) = app_strip.wav {
+                                    audio.set_channel_record_individual(channel.id, record);
+                                }
+                            }
+                            if app_strip.remove_clicked {
+                                remove_channel = Some(channel.id);
+                            }
+                        }
+
+                        let master_strip = draw_mixer_channel_strip(
+                            ui,
+                            MixerStripModel {
+                                title: "Master".to_owned(),
+                                source: "配信Mix".to_owned(),
+                                level: mix_level,
+                                gain_percent: settings.master_gain * 100.0,
+                                mute: None,
+                                mix: None,
+                                wav: None,
+                                removable: false,
+                            },
+                        );
+                        if master_strip.gain_changed {
+                            audio.set_master_gain(master_strip.gain_percent / 100.0);
+                        }
+                    });
+                });
+
+            if let Some(id) = remove_channel {
+                audio.remove_audio_channel(id);
+            }
+
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new("音声入出力・アプリ追加")
+                .id_salt("audio_io_controls")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.columns(2, |columns| {
+                        columns[0].label("PC音声デバイス");
+                        let selected_output = audio.selected_output_device();
+                        columns[0].add_enabled_ui(device_switch_enabled, |ui| {
+                            egui::ComboBox::from_id_salt("phase9_desktop_audio_device")
+                                .width(220.0)
+                                .selected_text(selection_label(&selected_output, &output_devices))
+                                .show_ui(ui, |ui| {
+                                    if ui.selectable_label(
+                                        selected_output == AudioDeviceSelection::Default,
+                                        "Windows既定",
+                                    ).clicked() {
+                                        audio.set_output_device(AudioDeviceSelection::Default);
+                                    }
+                                    for device in &output_devices {
+                                        let selection = AudioDeviceSelection::DeviceId(device.id.clone());
+                                        if ui.selectable_label(selected_output == selection, &device.name).clicked() {
+                                            audio.set_output_device(selection);
+                                        }
+                                    }
+                                });
+                        });
+
+                        columns[1].label("マイクデバイス");
+                        let selected_input = audio.selected_input_device();
+                        columns[1].add_enabled_ui(device_switch_enabled, |ui| {
+                            egui::ComboBox::from_id_salt("phase9_microphone_audio_device")
+                                .width(220.0)
+                                .selected_text(selection_label(&selected_input, &input_devices))
+                                .show_ui(ui, |ui| {
+                                    if ui.selectable_label(
+                                        selected_input == AudioDeviceSelection::Default,
+                                        "Windows既定",
+                                    ).clicked() {
+                                        audio.set_input_device(AudioDeviceSelection::Default);
+                                    }
+                                    for device in &input_devices {
+                                        let selection = AudioDeviceSelection::DeviceId(device.id.clone());
+                                        if ui.selectable_label(selected_input == selection, &device.name).clicked() {
+                                            audio.set_input_device(selection);
+                                        }
+                                    }
+                                });
+                        });
+                    });
+
+                    ui.separator();
+                    let mut ui_state_guard = match ui_state.lock() {
+                        Ok(guard) => guard,
+                        Err(_) => {
+                            ui.label("ミキサーUI状態を取得できません");
+                            return;
+                        }
+                    };
+                    let app_sources = audio.application_sources();
+                    let selected_app_label = ui_state_guard
+                        .selected_application_audio_pid
+                        .and_then(|pid| app_sources.iter().find(|source| source.capture_process_id == pid))
+                        .map(application_source_label)
+                        .unwrap_or_else(|| "アプリ音声を選択".to_owned());
+
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("phase9_application_audio_source")
+                            .width(220.0)
+                            .selected_text(compact_source_name(&selected_app_label, 28))
+                            .show_ui(ui, |ui| {
+                                if app_sources.is_empty() {
+                                    ui.label("音声を使用中のアプリがありません");
+                                }
+                                for source in &app_sources {
+                                    let label = application_source_label(source);
+                                    if ui.selectable_label(
+                                        ui_state_guard.selected_application_audio_pid == Some(source.capture_process_id),
+                                        &label,
+                                    ).on_hover_text(&label).clicked() {
+                                        ui_state_guard.selected_application_audio_pid = Some(source.capture_process_id);
+                                    }
+                                }
+                            });
+
+                        let selected_source = ui_state_guard
+                            .selected_application_audio_pid
+                            .and_then(|pid| app_sources.iter().find(|source| source.capture_process_id == pid).cloned());
+                        if ui.add_enabled(
+                            selected_source.is_some() && device_switch_enabled,
+                            egui::Button::new("＋ アプリ音声"),
+                        ).clicked() {
+                            if let Some(source) = selected_source {
+                                match audio.add_application_channel(source) {
+                                    Ok(_) => {
+                                        ui_state_guard.application_audio_message =
+                                            "アプリ音声チャンネルを追加しました".to_owned();
+                                    }
+                                    Err(err) => {
+                                        ui_state_guard.application_audio_message =
+                                            format!("アプリ音声追加失敗: {err}");
+                                    }
+                                }
+                            }
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(device_switch_enabled, egui::Button::new("アプリ音声一覧更新")).clicked() {
+                            match audio.refresh_application_sources() {
+                                Ok(()) => {
+                                    ui_state_guard.application_audio_message =
+                                        "アプリ音声一覧を更新しました".to_owned();
+                                }
+                                Err(err) => {
+                                    ui_state_guard.application_audio_message =
+                                        format!("アプリ音声一覧更新失敗: {err}");
+                                }
+                            }
+                        }
+                        if ui.add_enabled(device_switch_enabled, egui::Button::new("音声デバイス更新")).clicked() {
+                            match audio.refresh_devices() {
+                                Ok(()) => {
+                                    ui_state_guard.audio_message = "音声デバイス一覧を更新しました".to_owned();
+                                }
+                                Err(err) => {
+                                    ui_state_guard.audio_message = format!("デバイス更新失敗: {err}");
+                                }
+                            }
+                        }
+                    });
+                    ui.small(&ui_state_guard.application_audio_message);
+                    ui.small(&ui_state_guard.audio_message);
+                    if !device_switch_enabled {
+                        if let Some(reason) = &snapshot.device_switch_reason {
+                            ui.small(reason);
+                        }
+                    }
+                });
+
+            egui::CollapsingHeader::new("音声ルーティング説明")
+                .id_salt("audio_routing_help")
+                .default_open(false)
+                .show(ui, |ui| {
+                    ui.small("個別WAVは原音のまま保存（Gain/Muteは非破壊）");
+                    ui.small("Mix ONのチャンネルだけ完成MP4・配信Mixへ合流");
+                    ui.small("個別WAV保存 OFFでもMix用の一時原音は録画後に自動削除");
+                });
+        } else {
+            ui.label("音声デバイスを取得できていません");
+        }
+
+    // BGMプレイヤー自体はメインAppが所有するため、操作だけコマンドで返す。
+    for (id, gain_percent) in bgm_mixer_gain_changes {
+        send_mixer_command(
+            mixer_ctx,
+            command_tx,
+            MixerViewportCommand::BgmGain {
+                layer_id: id,
+                gain_percent,
+            },
+        );
+    }
+    for (id, muted) in bgm_mixer_mute_changes {
+        send_mixer_command(
+            mixer_ctx,
+            command_tx,
+            MixerViewportCommand::BgmMute { layer_id: id, muted },
+        );
+    }
+    if let Some(id) = bgm_mixer_remove {
+        send_mixer_command(
+            mixer_ctx,
+            command_tx,
+            MixerViewportCommand::RemoveBgm { layer_id: id },
+        );
+    }
+
+    ui.small("BGMは48kHz stereo PCMで配信Mixへ直接接続 / 個別WAVはAudio.2で追加します");
+    if let Ok(state) = ui_state.lock() {
+        ui.small(&state.audio_message);
+    }
+}
+
+
+
+fn prefer_selected_or_active_bgm<T: Copy>(
+    selected_bgm: Option<T>,
+    active_bgm: Option<T>,
+) -> Option<T> {
+    selected_bgm.or(active_bgm)
+}
+
 pub struct YaoyorozuApp {
     vm: StreamViewModel,
     elapsed_ms: u64,
@@ -446,16 +1571,26 @@ pub struct YaoyorozuApp {
     capture: Option<CaptureWorker>,
     capture_target_fps: u32,
 
-    preview_texture: Option<egui::TextureHandle>,
     preview_size: [u32; 2],
+    preview_snapshot: Arc<RwLock<PreviewRenderSnapshot>>,
+    streamed_preview_frame: Arc<RwLock<Option<stream_capture::CaptureFrame>>>,
+    preview_ui_state: Arc<Mutex<DeferredPreviewUiState>>,
+    preview_command_tx: mpsc::Sender<PreviewViewportCommand>,
+    preview_command_rx: mpsc::Receiver<PreviewViewportCommand>,
     preview_window_open: bool,
+    preview_window_position: Option<[f32; 2]>,
+    preview_window_size: Option<[f32; 2]>,
+    mixer_window_open: bool,
+    mixer_window_position: Option<[f32; 2]>,
+    mixer_window_size: Option<[f32; 2]>,
+    mixer_snapshot: Arc<RwLock<MixerRenderSnapshot>>,
+    mixer_ui_state: Arc<Mutex<DeferredMixerUiState>>,
+    mixer_command_tx: mpsc::Sender<MixerViewportCommand>,
+    mixer_command_rx: mpsc::Receiver<MixerViewportCommand>,
 
     capture_message: String,
     font_message: String,
-    audio: Option<AudioWorker>,
-    audio_message: String,
-    selected_application_audio_pid: Option<u32>,
-    application_audio_message: String,
+    audio: Option<Arc<AudioWorker>>,
     recording: Option<RecordingSession>,
     finalize_rx: Option<mpsc::Receiver<Result<RecordingPaths, stream_recording::RecordingError>>>,
     recording_message: String,
@@ -478,6 +1613,8 @@ pub struct YaoyorozuApp {
     image_library_message: String,
     bgm_layers: Vec<(LayerId, BgmLayerSource)>,
     bgm_players: HashMap<LayerId, BgmPlayer>,
+    bgm_pcm_senders: HashMap<LayerId, ExternalPcmSender>,
+    bgm_audio_channels: HashMap<LayerId, AudioChannelId>,
     bgm_library_dir: PathBuf,
     bgm_library_files: Vec<PathBuf>,
     bgm_library_message: String,
@@ -486,6 +1623,7 @@ pub struct YaoyorozuApp {
     streaming: Option<StreamingSession>,
     streaming_message: String,
     performance: PerformanceMonitor,
+    runtime_frame_counters: Arc<RuntimeFrameCounters>,
     settings_open: bool,
     settings_page: SettingsPage,
     addon_registry: AddonRegistry,
@@ -550,6 +1688,23 @@ impl YaoyorozuApp {
         let id = self.allocate_layer_id();
         self.layers
             .push(SceneLayer::new(id, LayerKind::Audio, source.name.clone()));
+
+        if let Some(audio) = self.audio.as_ref() {
+            match audio.add_external_pcm_channel(format!("BGM: {}", source.name)) {
+                Ok(sender) => {
+                    let channel_id = sender.channel_id();
+                    audio.set_channel_gain(channel_id, source.volume_linear());
+                    audio.set_channel_muted(channel_id, source.muted);
+                    audio.set_channel_include_in_stream_mix(channel_id, true);
+                    self.bgm_audio_channels.insert(id, channel_id);
+                    self.bgm_pcm_senders.insert(id, sender);
+                }
+                Err(err) => {
+                    self.bgm_message = format!("BGM PCMチャンネル作成失敗: {err}");
+                }
+            }
+        }
+
         self.bgm_layers.push((id, source));
         id
     }
@@ -557,6 +1712,14 @@ impl YaoyorozuApp {
     fn remove_bgm_layer(&mut self, id: LayerId) {
         if let Some(player) = self.bgm_players.remove(&id) {
             player.stop();
+        }
+        if let Some(sender) = self.bgm_pcm_senders.remove(&id) {
+            sender.clear_level();
+        }
+        if let Some(channel_id) = self.bgm_audio_channels.remove(&id) {
+            if let Some(audio) = self.audio.as_ref() {
+                audio.remove_audio_channel(channel_id);
+            }
         }
         self.layers.retain(|layer| layer.id != id);
         self.bgm_layers.retain(|(layer_id, _)| *layer_id != id);
@@ -598,7 +1761,8 @@ impl YaoyorozuApp {
         let loop_enabled = source.loop_enabled;
         let volume = source.effective_volume();
         let name = source.name.clone();
-        match BgmPlayer::play_file(&path, loop_enabled, volume) {
+        let pcm_sender = self.bgm_pcm_senders.get(&id).cloned();
+        match BgmPlayer::play_file(&path, loop_enabled, volume, pcm_sender) {
             Ok(player) => {
                 if let Some(old) = self.bgm_players.insert(id, player) {
                     old.stop();
@@ -699,7 +1863,7 @@ impl YaoyorozuApp {
                 if let Some(id) = persisted_settings.input_device_id.clone() {
                     worker.set_input_device(AudioDeviceSelection::DeviceId(id));
                 }
-                (Some(worker), "WASAPI音声メーター: 稼働中".to_owned())
+                (Some(Arc::new(worker)), "WASAPI音声メーター: 稼働中".to_owned())
             }
             Err(err) => (None, format!("音声開始失敗: {err}")),
         };
@@ -739,6 +1903,33 @@ impl YaoyorozuApp {
             bgm_library_dir.display()
         );
 
+        let overlay_source = OverlaySource::default();
+        let image_overlays = Vec::new();
+        let app_started_at = Instant::now();
+        let preview_snapshot = Arc::new(RwLock::new(PreviewRenderSnapshot {
+            layers: layers.clone(),
+            overlay_source: overlay_source.clone(),
+            image_overlays: image_overlays.clone(),
+            selected_layer: None,
+            fish_layer_id,
+            app_started_at,
+        }));
+        let streamed_preview_frame = Arc::new(RwLock::new(None));
+        let preview_ui_state = Arc::new(Mutex::new(DeferredPreviewUiState::default()));
+        let (preview_command_tx, preview_command_rx) = mpsc::channel();
+
+        let mixer_snapshot = Arc::new(RwLock::new(MixerRenderSnapshot {
+            bgm_rows: Vec::new(),
+            device_switch_enabled: true,
+            device_switch_reason: None,
+        }));
+        let mixer_ui_state = Arc::new(Mutex::new(DeferredMixerUiState {
+            audio_message: audio_message.clone(),
+            ..DeferredMixerUiState::default()
+        }));
+        let (mixer_command_tx, mixer_command_rx) = mpsc::channel();
+        let runtime_frame_counters = Arc::new(RuntimeFrameCounters::default());
+
         Self {
             vm,
             elapsed_ms: 0,
@@ -747,15 +1938,29 @@ impl YaoyorozuApp {
             selected_source,
             capture,
             capture_target_fps,
-            preview_texture: None,
             preview_size: [0, 0],
+            preview_snapshot,
+            streamed_preview_frame,
+            preview_ui_state,
+            preview_command_tx,
+            preview_command_rx,
             preview_window_open: persisted_settings.preview_window_open,
+            preview_window_position: sanitize_window_position(
+                persisted_settings.preview_window_position,
+            ),
+            preview_window_size: sanitize_window_size(persisted_settings.preview_window_size),
+            mixer_window_open: persisted_settings.mixer_window.open,
+            mixer_window_position: sanitize_window_position(
+                persisted_settings.mixer_window.position,
+            ),
+            mixer_window_size: sanitize_window_size(persisted_settings.mixer_window.size),
+            mixer_snapshot,
+            mixer_ui_state,
+            mixer_command_tx,
+            mixer_command_rx,
             capture_message,
             font_message,
             audio,
-            audio_message,
-            selected_application_audio_pid: None,
-            application_audio_message: "アプリ音声: 一覧から選択してください".to_owned(),
             recording: None,
             finalize_rx: None,
             recording_message: "録画: 待機中".to_owned(),
@@ -765,27 +1970,30 @@ impl YaoyorozuApp {
             capture_preview_mode: PreviewMode::Fps30,
             streaming_target,
             show_stream_key: false,
-            overlay_source: OverlaySource::default(),
+            overlay_source,
             layers,
             selected_layer: None,
             next_layer_id: fish_layer_id + 1,
             fish_layer_id,
             preview_resize_drag: false,
-            image_overlays: Vec::new(),
+            image_overlays,
             image_overlay_message: "画像オーバーレイ: 未追加".to_owned(),
             image_library_dir,
             image_library_files,
             image_library_message,
             bgm_layers: Vec::new(),
             bgm_players: HashMap::new(),
+            bgm_pcm_senders: HashMap::new(),
+            bgm_audio_channels: HashMap::new(),
             bgm_library_dir,
             bgm_library_files,
             bgm_library_message,
             bgm_message: "BGM: 未追加".to_owned(),
-            app_started_at: std::time::Instant::now(),
+            app_started_at,
             streaming: None,
             streaming_message: "配信: 待機中".to_owned(),
             performance: PerformanceMonitor::new(),
+            runtime_frame_counters,
             settings_open: false,
             settings_page: SettingsPage::General,
             addon_registry: AddonRegistry::new(),
@@ -828,6 +2036,12 @@ impl YaoyorozuApp {
         settings.streaming_server_url = self.streaming_target.server_url.clone();
         settings.streaming_video_bitrate_kbps = self.streaming_target.video_bitrate_kbps;
         settings.preview_window_open = self.preview_window_open;
+        settings.preview_window_position =
+            sanitize_window_position(self.preview_window_position);
+        settings.preview_window_size = sanitize_window_size(self.preview_window_size);
+        settings.mixer_window.open = self.mixer_window_open;
+        settings.mixer_window.position = sanitize_window_position(self.mixer_window_position);
+        settings.mixer_window.size = sanitize_window_size(self.mixer_window_size);
 
         if let Some(audio) = &self.audio {
             settings.input_device_id = match audio.selected_input_device() {
@@ -919,8 +2133,14 @@ impl YaoyorozuApp {
         // Drop previous worker first. Worker owns its capture thread and joins
         // during Drop, keeping capture lifetime localized.
         self.capture = None;
-        self.preview_texture = None;
         self.preview_size = [0, 0];
+        if let Ok(mut state) = self.preview_ui_state.lock() {
+            state.texture = None;
+            state.resize_drag_layer = None;
+        }
+        if let Ok(mut frame) = self.streamed_preview_frame.write() {
+            *frame = None;
+        }
 
         match CaptureWorker::start(source.clone(), self.capture_target_fps) {
             Ok(worker) => {
@@ -980,103 +2200,230 @@ impl YaoyorozuApp {
         }
     }
 
-    fn update_preview_texture(&mut self, ctx: &egui::Context) {
+    fn make_preview_snapshot(&self) -> PreviewRenderSnapshot {
+        PreviewRenderSnapshot {
+            layers: self.layers.clone(),
+            overlay_source: self.overlay_source.clone(),
+            image_overlays: self.image_overlays.clone(),
+            selected_layer: self.selected_layer,
+            fish_layer_id: self.fish_layer_id,
+            app_started_at: self.app_started_at.clone(),
+        }
+    }
+
+    fn sync_preview_snapshot(&self) {
+        if let Ok(mut snapshot) = self.preview_snapshot.write() {
+            *snapshot = self.make_preview_snapshot();
+        }
+    }
+
+    fn sync_preview_dimensions_from_latest(&mut self) {
         let Some(capture) = &self.capture else {
             return;
         };
+        if let Some(frame) = capture.latest_preview_frame() {
+            self.preview_size = [frame.width, frame.height];
+        }
+    }
 
+    fn drain_preview_commands(&mut self) {
+        while let Ok(command) = self.preview_command_rx.try_recv() {
+            match command {
+                PreviewViewportCommand::Close => {
+                    self.preview_window_open = false;
+                }
+                PreviewViewportCommand::Geometry { position, size } => {
+                    self.preview_window_position = sanitize_window_position(position);
+                    self.preview_window_size = sanitize_window_size(size);
+                }
+                PreviewViewportCommand::Select(layer_id) => {
+                    self.selected_layer = layer_id;
+                    self.preview_resize_drag = false;
+                }
+                PreviewViewportCommand::Move {
+                    layer_id,
+                    delta_x,
+                    delta_y,
+                    preview_width,
+                    preview_height,
+                    source_width,
+                    source_height,
+                } => {
+                    if self.layer_locked(layer_id) {
+                        continue;
+                    }
+                    self.selected_layer = Some(layer_id);
+                    if layer_id == self.fish_layer_id {
+                        self.overlay_source.move_by_preview_delta(
+                            delta_x,
+                            delta_y,
+                            preview_width,
+                            preview_height,
+                            source_width,
+                            source_height,
+                        );
+                    } else if let Some((_, overlay)) = self
+                        .image_overlays
+                        .iter_mut()
+                        .find(|(id, _)| *id == layer_id)
+                    {
+                        overlay.move_by_preview_delta(
+                            delta_x,
+                            delta_y,
+                            preview_width,
+                            preview_height,
+                            source_width,
+                            source_height,
+                        );
+                    }
+                }
+                PreviewViewportCommand::Resize {
+                    layer_id,
+                    delta_x,
+                    preview_width,
+                    source_width,
+                    source_height,
+                } => {
+                    if self.layer_locked(layer_id) {
+                        continue;
+                    }
+                    self.selected_layer = Some(layer_id);
+                    if layer_id == self.fish_layer_id {
+                        self.overlay_source.resize_by_preview_delta(
+                            delta_x,
+                            preview_width,
+                            source_width,
+                            source_height,
+                        );
+                    } else if let Some((_, overlay)) = self
+                        .image_overlays
+                        .iter_mut()
+                        .find(|(id, _)| *id == layer_id)
+                    {
+                        overlay.resize_by_preview_delta(
+                            delta_x,
+                            preview_width,
+                            source_width,
+                            source_height,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn sync_mixer_snapshot(&self) {
+        if let Ok(mut snapshot) = self.mixer_snapshot.write() {
+            snapshot.bgm_rows = self
+                .bgm_layers
+                .iter()
+                .map(|(id, source)| {
+                    (
+                        *id,
+                        self.bgm_audio_channels.get(id).copied(),
+                        source.name.clone(),
+                        source.volume_percent,
+                        source.muted,
+                    )
+                })
+                .collect();
+            snapshot.device_switch_enabled = self.recording.is_none()
+                && self.finalize_rx.is_none()
+                && self.streaming.is_none();
+            snapshot.device_switch_reason = if self.streaming.is_some() {
+                Some("配信中は音声デバイスとアプリ構成を固定します".to_owned())
+            } else if self.recording.is_some() || self.finalize_rx.is_some() {
+                Some("録画中は音声デバイスとアプリ構成を固定します".to_owned())
+            } else {
+                None
+            };
+        }
+    }
+
+    fn drain_mixer_commands(&mut self) {
+        while let Ok(command) = self.mixer_command_rx.try_recv() {
+            match command {
+                MixerViewportCommand::Close => {
+                    self.mixer_window_open = false;
+                }
+                MixerViewportCommand::Geometry { position, size } => {
+                    self.mixer_window_position = sanitize_window_position(position);
+                    self.mixer_window_size = sanitize_window_size(size);
+                }
+                MixerViewportCommand::BgmGain {
+                    layer_id,
+                    gain_percent,
+                } => {
+                    if let Some((_, source)) = self
+                        .bgm_layers
+                        .iter_mut()
+                        .find(|(id, _)| *id == layer_id)
+                    {
+                        source.volume_percent = gain_percent.clamp(0.0, 100.0);
+                        if let Some(player) = self.bgm_players.get(&layer_id) {
+                            player.set_volume(source.effective_volume());
+                        }
+                        if let Some(channel_id) = self.bgm_audio_channels.get(&layer_id).copied() {
+                            if let Some(audio) = self.audio.as_ref() {
+                                audio.set_channel_gain(channel_id, source.volume_linear());
+                            }
+                        }
+                    }
+                }
+                MixerViewportCommand::BgmMute { layer_id, muted } => {
+                    if let Some((_, source)) = self
+                        .bgm_layers
+                        .iter_mut()
+                        .find(|(id, _)| *id == layer_id)
+                    {
+                        source.muted = muted;
+                        if let Some(player) = self.bgm_players.get(&layer_id) {
+                            player.set_volume(source.effective_volume());
+                        }
+                        if let Some(channel_id) = self.bgm_audio_channels.get(&layer_id).copied() {
+                            if let Some(audio) = self.audio.as_ref() {
+                                audio.set_channel_muted(channel_id, muted);
+                            }
+                        }
+                    }
+                }
+                MixerViewportCommand::RemoveBgm { layer_id } => {
+                    self.remove_bgm_layer(layer_id);
+                    self.bgm_message = if self.bgm_layers.is_empty() {
+                        "BGM: 未追加".to_owned()
+                    } else {
+                        format!("BGM削除 / 残り {} 曲", self.bgm_layers.len())
+                    };
+                }
+            }
+        }
+    }
+
+    fn push_streaming_frame_if_available(&mut self) {
+        if self.streaming.is_none() {
+            return;
+        }
+
+        let Some(capture) = &self.capture else {
+            return;
+        };
         let mut newest = None;
         while let Ok(frame) = capture.try_recv() {
             newest = Some(frame);
         }
-
         let Some(frame) = newest else {
             return;
         };
 
         self.preview_size = [frame.width, frame.height];
-
-        let needs_stream_frame = self.streaming.is_some();
-        let needs_ui_texture = self.preview_window_open;
-        if !needs_stream_frame && !needs_ui_texture {
-            // Hidden preview + no live stream: dimensions are all we need.
-            // Avoid RGBA clones, CPU overlay composition and egui texture uploads.
-            return;
+        let snapshot = self.make_preview_snapshot();
+        let composed_frame = compose_preview_frame(frame, &snapshot);
+        if let Ok(mut preview_frame) = self.streamed_preview_frame.write() {
+            *preview_frame = Some(composed_frame.clone());
         }
-
-        let overlay_enabled = self.layers.iter().any(|layer| match layer.kind {
-            LayerKind::FishOverlay if layer.id == self.fish_layer_id => self.overlay_source.enabled,
-            LayerKind::Image => self
-                .image_overlays
-                .iter()
-                .find(|(id, _)| *id == layer.id)
-                .is_some_and(|(_, overlay)| overlay.enabled),
-            _ => false,
-        });
-
-        // Keep the original Arc-backed capture frame whenever no overlay is
-        // active. This removes one full 960x540 RGBA allocation/copy per frame.
-        //
-        // `self.layers` is stored back-to-front. Composing in vector order
-        // therefore makes the last item the visible front layer, matching the
-        // layer list UI (which displays the vector in reverse).
-        let composed_frame = if overlay_enabled {
-            let mut composed_rgba = frame.rgba.to_vec();
-            for layer in &self.layers {
-                match layer.kind {
-                    LayerKind::FishOverlay if layer.id == self.fish_layer_id => {
-                        self.overlay_source.compose_test_overlay(
-                            &mut composed_rgba,
-                            frame.width,
-                            frame.height,
-                            self.app_started_at.elapsed().as_secs_f32(),
-                        );
-                    }
-                    LayerKind::Image => {
-                        if let Some((_, image_overlay)) = self
-                            .image_overlays
-                            .iter()
-                            .find(|(id, _)| *id == layer.id)
-                        {
-                            image_overlay.compose(&mut composed_rgba, frame.width, frame.height);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            stream_capture::CaptureFrame {
-                sequence: frame.sequence,
-                width: frame.width,
-                height: frame.height,
-                rgba: std::sync::Arc::<[u8]>::from(composed_rgba),
-            }
-        } else {
-            frame
-        };
-
         if let Some(streaming) = &self.streaming {
             streaming.push_video_frame(&composed_frame);
-        }
-
-        if !needs_ui_texture {
-            // Streaming can keep using the composited frame while the preview
-            // window is closed, without paying for ColorImage/texture upload.
-            return;
-        }
-
-        let image = egui::ColorImage::from_rgba_unmultiplied(
-            [
-                composed_frame.width as usize,
-                composed_frame.height as usize,
-            ],
-            &composed_frame.rgba,
-        );
-
-        if let Some(texture) = &mut self.preview_texture {
-            texture.set(image, egui::TextureOptions::LINEAR);
-        } else {
-            self.preview_texture =
-                Some(ctx.load_texture("capture-preview", image, egui::TextureOptions::LINEAR));
+            self.runtime_frame_counters.count_streaming_output_frame();
         }
     }
 
@@ -1115,19 +2462,25 @@ impl YaoyorozuApp {
             .map(|audio| audio.device_state())
             .unwrap_or_default();
 
-        let channel_mixer = self
+        let (channel_mixer, external_pcm_sources) = self
             .audio
             .as_ref()
-            .map(|audio| audio.channel_mixer())
-            .unwrap_or_default();
+            .map(|audio| {
+                (
+                    audio.channel_mixer(),
+                    audio.external_pcm_recording_sources(),
+                )
+            })
+            .unwrap_or_else(|| (ChannelMixerControl::default(), Vec::new()));
 
-        match RecordingSession::start_with_audio_routing(
+        match RecordingSession::start_with_audio_routing_and_external(
             "recordings",
             config,
             gpu,
             mixer,
             channel_mixer,
             audio_devices,
+            external_pcm_sources,
         ) {
             Ok(session) => {
                 self.recording_message = format!(
@@ -1405,251 +2758,120 @@ impl YaoyorozuApp {
             });
     }
 
-    fn draw_preview_canvas(
-        &mut self,
-        ui: &mut egui::Ui,
-        outer_size: egui::Vec2,
-        compact_info: bool,
-    ) {
-        let desired = egui::vec2(outer_size.x.max(120.0), outer_size.y.max(120.0));
-        let (outer, outer_response) = ui.allocate_exact_size(desired, egui::Sense::click());
-        ui.painter()
-            .rect_filled(outer, 4.0, egui::Color32::from_rgb(18, 20, 24));
-
-        let mut overlay_interacted = false;
-        if let Some(texture) = &self.preview_texture {
-            let (draw_w, draw_h) = fit_aspect(
-                self.preview_size[0] as f32,
-                self.preview_size[1] as f32,
-                outer.width(),
-                outer.height(),
-            );
-            let image_rect =
-                egui::Rect::from_center_size(outer.center(), egui::vec2(draw_w, draw_h));
-            ui.painter().image(
-                texture.id(),
-                image_rect,
-                egui::Rect::from_min_max(egui::Pos2::new(0.0, 0.0), egui::Pos2::new(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
-
-            if self.overlay_source.enabled && self.preview_size[0] > 0 && self.preview_size[1] > 0 {
-                let fish_locked = self.layer_locked(self.fish_layer_id);
-                let fish_w = image_rect.width() * self.overlay_source.width_percent / 100.0;
-                let fish_h = fish_w * 0.42;
-                let bounce = if self.overlay_source.bounce {
-                    (self.app_started_at.elapsed().as_secs_f32() * 4.2)
-                        .sin()
-                        .abs()
-                        * image_rect.height()
-                        * 0.055
-                } else {
-                    0.0
-                };
-                let center = egui::pos2(
-                    image_rect.left() + image_rect.width() * self.overlay_source.x_percent / 100.0,
-                    image_rect.top() + image_rect.height() * self.overlay_source.y_percent / 100.0
-                        - bounce,
-                );
-                let fish_rect = egui::Rect::from_center_size(center, egui::vec2(fish_w, fish_h));
-                let hit_rect = fish_rect.expand(5.0).intersect(image_rect);
-                let fish_response = ui.interact(
-                    hit_rect,
-                    ui.id().with("overlay_fish_drag"),
-                    egui::Sense::click_and_drag(),
-                );
-
-                let handle_size = 12.0;
-                let handle_rect = egui::Rect::from_center_size(
-                    fish_rect.right_bottom(),
-                    egui::vec2(handle_size, handle_size),
-                );
-
-                if fish_response.clicked() {
-                    self.selected_layer = Some(self.fish_layer_id);
-                    overlay_interacted = true;
-                }
-                if fish_response.drag_started() {
-                    self.selected_layer = Some(self.fish_layer_id);
-                    overlay_interacted = true;
-                    self.preview_resize_drag = !fish_locked
-                        && ui
-                            .ctx()
-                            .pointer_interact_pos()
-                            .map(|p| handle_rect.expand(5.0).contains(p))
-                            .unwrap_or(false);
-                }
-                if fish_response.dragged() {
-                    overlay_interacted = true;
-                    // egui::Response::drag_delta() is cumulative from drag start.
-                    // Applying that value every repaint makes transform editing unstable.
-                    // Use the pointer's per-frame delta while this layer owns the drag.
-                    let delta = ui.ctx().input(|i| i.pointer.delta());
-                    if fish_locked {
-                        // Locked layers can still be selected, but transforms are ignored.
-                    } else if self.preview_resize_drag {
-                        self.overlay_source.resize_by_preview_delta(
-                            delta.x,
-                            image_rect.width(),
-                            self.preview_size[0],
-                            self.preview_size[1],
-                        );
-                    } else {
-                        self.overlay_source.move_by_preview_delta(
-                            delta.x,
-                            delta.y,
-                            image_rect.width(),
-                            image_rect.height(),
-                            self.preview_size[0],
-                            self.preview_size[1],
-                        );
-                    }
-                }
-                if fish_response.drag_stopped() {
-                    self.preview_resize_drag = false;
-                }
-
-                if self.selected_layer == Some(self.fish_layer_id) {
-                    let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(100, 190, 255));
-                    ui.painter()
-                        .rect_stroke(fish_rect, 2.0, stroke, egui::StrokeKind::Outside);
-                    ui.painter().rect_filled(
-                        handle_rect,
-                        1.0,
-                        egui::Color32::from_rgb(100, 190, 255),
-                    );
-                }
-            }
-
-            let image_layer_ids: Vec<LayerId> = self
-                .layers
-                .iter()
-                .rev()
-                .filter(|layer| layer.kind == LayerKind::Image)
-                .map(|layer| layer.id)
-                .collect();
-
-            for image_layer_id in image_layer_ids {
-                let image_locked = self.layer_locked(image_layer_id);
-                let Some(image_index) = self
-                    .image_overlays
-                    .iter()
-                    .position(|(id, _)| *id == image_layer_id)
-                else {
-                    continue;
-                };
-                let image_overlay = &mut self.image_overlays[image_index].1;
-                if !image_overlay.enabled || self.preview_size[0] == 0 || self.preview_size[1] == 0 {
-                    continue;
-                }
-
-                let overlay_w = image_rect.width() * image_overlay.width_percent / 100.0;
-                let overlay_h = overlay_w * image_overlay.aspect();
-                let center = egui::pos2(
-                    image_rect.left() + image_rect.width() * image_overlay.x_percent / 100.0,
-                    image_rect.top() + image_rect.height() * image_overlay.y_percent / 100.0,
-                );
-                let overlay_rect =
-                    egui::Rect::from_center_size(center, egui::vec2(overlay_w, overlay_h));
-                let hit_rect = overlay_rect.expand(5.0).intersect(image_rect);
-                let image_response = ui.interact(
-                    hit_rect,
-                    ui.id().with(("overlay_image_drag", image_layer_id)),
-                    egui::Sense::click_and_drag(),
-                );
-                let handle_size = 12.0;
-                let handle_rect = egui::Rect::from_center_size(
-                    overlay_rect.right_bottom(),
-                    egui::vec2(handle_size, handle_size),
-                );
-
-                if image_response.clicked() {
-                    self.selected_layer = Some(image_layer_id);
-                    overlay_interacted = true;
-                }
-                if image_response.drag_started() {
-                    self.selected_layer = Some(image_layer_id);
-                    overlay_interacted = true;
-                    self.preview_resize_drag = !image_locked
-                        && ui
-                            .ctx()
-                            .pointer_interact_pos()
-                            .map(|p| handle_rect.expand(5.0).contains(p))
-                            .unwrap_or(false);
-                }
-                if image_response.dragged() {
-                    overlay_interacted = true;
-                    let delta = ui.ctx().input(|i| i.pointer.delta());
-                    if image_locked {
-                        // Locked layers can still be selected, but transforms are ignored.
-                    } else if self.preview_resize_drag {
-                        image_overlay.resize_by_preview_delta(
-                            delta.x,
-                            image_rect.width(),
-                            self.preview_size[0],
-                            self.preview_size[1],
-                        );
-                    } else {
-                        image_overlay.move_by_preview_delta(
-                            delta.x,
-                            delta.y,
-                            image_rect.width(),
-                            image_rect.height(),
-                            self.preview_size[0],
-                            self.preview_size[1],
-                        );
-                    }
-                }
-                if image_response.drag_stopped() {
-                    self.preview_resize_drag = false;
-                }
-
-                if self.selected_layer == Some(image_layer_id) {
-                    let stroke =
-                        egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(130, 220, 140));
-                    ui.painter().rect_stroke(
-                        overlay_rect,
-                        2.0,
-                        stroke,
-                        egui::StrokeKind::Outside,
-                    );
-                    ui.painter().rect_filled(
-                        handle_rect,
-                        1.0,
-                        egui::Color32::from_rgb(130, 220, 140),
-                    );
-                }
-            }
-
-            if outer_response.clicked() && !overlay_interacted {
-                if let Some(pointer) = outer_response.interact_pointer_pos() {
-                    if image_rect.contains(pointer) {
-                        self.selected_layer = None;
-                        self.preview_resize_drag = false;
-                    }
-                }
-            }
-        } else {
-            ui.painter().text(
-                outer.center(),
-                egui::Align2::CENTER_CENTER,
-                "キャプチャ待機中…",
-                egui::FontId::proportional(16.0),
-                egui::Color32::LIGHT_GRAY,
-            );
+    fn show_mixer_viewport(&mut self, ctx: &egui::Context) {
+        if !self.mixer_window_open {
+            return;
         }
 
-        if compact_info {
-            ui.small(format!(
-                "入力 {}×{} / プレビュー窓でドラッグ編集",
-                self.preview_size[0], self.preview_size[1]
-            ));
-        } else {
-            ui.small(format!(
-                "プレビュー別窓 / 入力 {}×{} / 画像・ししゃものドラッグ編集対応",
-                self.preview_size[0], self.preview_size[1]
-            ));
+        self.mixer_window_position = sanitize_window_position(self.mixer_window_position);
+        self.mixer_window_size = sanitize_window_size(self.mixer_window_size);
+
+        if let Ok(mut state) = self.mixer_ui_state.lock() {
+            if state.last_window_position.is_none() {
+                state.last_window_position = self.mixer_window_position;
+            }
+            if state.last_window_size.is_none() {
+                state.last_window_size = self.mixer_window_size;
+            }
         }
+
+        let viewport_id = egui::ViewportId::from_hash_of("tsubame_audio_mixer_window");
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title("燕 - 音声ミキサー")
+            .with_inner_size(self.mixer_window_size.unwrap_or([900.0, 560.0]))
+            .with_min_inner_size([520.0, 360.0]);
+        if let Some([x, y]) = self.mixer_window_position {
+            builder = builder.with_position([x, y]);
+        }
+
+        let audio = self.audio.as_ref().map(Arc::clone);
+        let snapshot = Arc::clone(&self.mixer_snapshot);
+        let ui_state = Arc::clone(&self.mixer_ui_state);
+        let command_tx = self.mixer_command_tx.clone();
+        let runtime_frame_counters = Arc::clone(&self.runtime_frame_counters);
+
+        ctx.show_viewport_deferred(viewport_id, builder, move |mixer_ctx, _class| {
+            runtime_frame_counters.count_mixer_ui_frame();
+            let viewport_info = mixer_ctx.input(|input| input.viewport().clone());
+            if viewport_info.close_requested() {
+                send_mixer_command(mixer_ctx, &command_tx, MixerViewportCommand::Close);
+                return;
+            }
+
+            let position = viewport_info
+                .outer_rect
+                .map(|rect| [rect.min.x, rect.min.y]);
+            let size = viewport_info
+                .inner_rect
+                .map(|rect| [rect.width(), rect.height()]);
+
+            let mut geometry_command = None;
+            if let Ok(mut state) = ui_state.lock() {
+                let observed_position = position.or(state.last_window_position);
+                let observed_size = size.or(state.last_window_size);
+                let changed = geometry_changed(state.last_window_position, observed_position)
+                    || geometry_changed(state.last_window_size, observed_size);
+                if changed {
+                    state.last_window_position = observed_position;
+                    state.last_window_size = observed_size;
+                    geometry_command = Some(MixerViewportCommand::Geometry {
+                        position: observed_position,
+                        size: observed_size,
+                    });
+                }
+            }
+            if let Some(command) = geometry_command {
+                send_mixer_command(mixer_ctx, &command_tx, command);
+            }
+
+            let snapshot_value = snapshot.read().map(|value| value.clone()).unwrap_or_default();
+            let now = Instant::now();
+            let meter_snapshot = if let Ok(mut state) = ui_state.lock() {
+                if mixer_meter_refresh_due(state.last_meter_refresh, now) {
+                    if let Some(audio) = audio.as_ref() {
+                        let levels = audio.levels();
+                        state.meter_snapshot.desktop = levels.desktop;
+                        state.meter_snapshot.mic = levels.mic;
+                        state.meter_snapshot.mix = levels.mix;
+                        state.meter_snapshot.application_levels = audio
+                            .audio_channels()
+                            .into_iter()
+                            .map(|channel| (channel.id, channel.current_level))
+                            .collect();
+                    } else {
+                        state.meter_snapshot = MixerMeterSnapshot::default();
+                    }
+                    state.last_meter_refresh = Some(now);
+                    runtime_frame_counters.count_mixer_meter_update();
+                }
+                state.meter_snapshot.clone()
+            } else {
+                MixerMeterSnapshot::default()
+            };
+
+            egui::CentralPanel::default().show(mixer_ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("音声ミキサー");
+                    ui.separator();
+                    ui.small("閉じても配信・録画・BGM音声は継続");
+                    if ui.button("閉じる").clicked() {
+                        send_mixer_command(mixer_ctx, &command_tx, MixerViewportCommand::Close);
+                    }
+                });
+                ui.separator();
+                draw_deferred_audio_mixer(
+                    mixer_ctx,
+                    ui,
+                    audio.as_ref(),
+                    &meter_snapshot,
+                    &snapshot_value,
+                    &ui_state,
+                    &command_tx,
+                );
+            });
+
+            mixer_ctx.request_repaint_after(Duration::from_millis(mixer_ui_repaint_ms(true)));
+        });
     }
 
     fn show_preview_viewport(&mut self, ctx: &egui::Context) {
@@ -1657,18 +2879,77 @@ impl YaoyorozuApp {
             return;
         }
 
+        self.preview_window_position = sanitize_window_position(self.preview_window_position);
+        self.preview_window_size = sanitize_window_size(self.preview_window_size);
+
         let [default_w, default_h] = normal_preview_size();
         let viewport_id = egui::ViewportId::from_hash_of("yaoyorozu_preview_window");
-        let builder = egui::ViewportBuilder::default()
+        let mut builder = egui::ViewportBuilder::default()
             .with_title("燕 / Tsubame Preview")
-            .with_inner_size([default_w + 40.0, default_h + 80.0])
+            .with_inner_size(
+                self.preview_window_size
+                    .unwrap_or([default_w + 40.0, default_h + 80.0]),
+            )
             .with_min_inner_size([360.0, 240.0]);
-        let mut close_requested = false;
+        if let Some([x, y]) = self.preview_window_position {
+            builder = builder.with_position([x, y]);
+        }
 
-        ctx.show_viewport_immediate(viewport_id, builder, |preview_ctx, _class| {
-            if preview_ctx.input(|i| i.viewport().close_requested()) {
-                close_requested = true;
+        let latest_frame: Option<LatestFrameSnapshot> =
+            self.capture.as_ref().map(|capture| capture.latest_preview_handle());
+        let streamed_frame = self
+            .streaming
+            .as_ref()
+            .map(|_| Arc::clone(&self.streamed_preview_frame));
+        let snapshot = Arc::clone(&self.preview_snapshot);
+        let ui_state = Arc::clone(&self.preview_ui_state);
+        let command_tx = self.preview_command_tx.clone();
+        let runtime_frame_counters = Arc::clone(&self.runtime_frame_counters);
+
+        ctx.show_viewport_deferred(viewport_id, builder, move |preview_ctx, _class| {
+            runtime_frame_counters.count_preview_ui_frame();
+            let viewport_info = preview_ctx.input(|input| input.viewport().clone());
+            if viewport_info.close_requested() {
+                send_preview_command(preview_ctx, &command_tx, PreviewViewportCommand::Close);
+                return;
             }
+
+            let position = viewport_info
+                .outer_rect
+                .map(|rect| [rect.min.x, rect.min.y]);
+            let size = viewport_info
+                .inner_rect
+                .map(|rect| [rect.width(), rect.height()]);
+
+            let mut geometry_command = None;
+            if let Ok(mut state) = ui_state.lock() {
+                // Some platforms briefly report one of these rectangles as None while
+                // a native viewport is being created. Keep the last known value so we
+                // never erase a valid sub-monitor restore position with a transient None.
+                let observed_position = position.or(state.last_window_position);
+                let observed_size = size.or(state.last_window_size);
+                let changed = geometry_changed(state.last_window_position, observed_position)
+                    || geometry_changed(state.last_window_size, observed_size);
+                if changed {
+                    state.last_window_position = observed_position;
+                    state.last_window_size = observed_size;
+                    geometry_command = Some(PreviewViewportCommand::Geometry {
+                        position: observed_position,
+                        size: observed_size,
+                    });
+                }
+            }
+            if let Some(command) = geometry_command {
+                send_preview_command(preview_ctx, &command_tx, command);
+            }
+
+            let snapshot_value = match snapshot.read() {
+                Ok(snapshot) => snapshot.clone(),
+                Err(_) => {
+                    preview_ctx.request_repaint_after(Duration::from_millis(33));
+                    return;
+                }
+            };
 
             egui::CentralPanel::default().show(preview_ctx, |ui| {
                 ui.horizontal(|ui| {
@@ -1676,18 +2957,30 @@ impl YaoyorozuApp {
                     ui.separator();
                     ui.small("閉じても配信・録画は続行");
                     if ui.button("閉じる").clicked() {
-                        close_requested = true;
+                        send_preview_command(
+                            preview_ctx,
+                            &command_tx,
+                            PreviewViewportCommand::Close,
+                        );
                     }
                 });
                 ui.separator();
                 let available = ui.available_size();
-                self.draw_preview_canvas(ui, available, false);
+                draw_deferred_preview_canvas(
+                    preview_ctx,
+                    ui,
+                    available,
+                    &snapshot_value,
+                    latest_frame.as_ref(),
+                    streamed_frame.as_ref(),
+                    &ui_state,
+                    &command_tx,
+                );
             });
-        });
 
-        if close_requested {
-            self.preview_window_open = false;
-        }
+            // Deferred viewport repaints independently from the main control UI.
+            preview_ctx.request_repaint_after(Duration::from_millis(33));
+        });
     }
 
     fn show_settings_window(&mut self, ctx: &egui::Context) {
@@ -1837,15 +3130,35 @@ impl YaoyorozuApp {
     }
 }
 
+fn toggle_window_open(open: &mut bool) {
+    *open = !*open;
+}
+
 impl eframe::App for YaoyorozuApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.drain_preview_commands();
+        self.drain_mixer_commands();
         self.bgm_players.retain(|_, player| !player.is_finished());
         self.poll_recording_finalize();
         self.poll_streaming();
-        self.performance.refresh_if_due();
+        let recording_encoded_frames = self
+            .recording
+            .as_ref()
+            .map(|recording| recording.encoded_frames());
+        let streaming_active = self.streaming.is_some();
+        let runtime_frame_counters = Arc::clone(&self.runtime_frame_counters);
+        self.performance.refresh_if_due(
+            runtime_frame_counters.as_ref(),
+            recording_encoded_frames,
+            streaming_active,
+        );
         self.sync_capture_preview_mode();
-        self.update_preview_texture(ctx);
+        self.sync_preview_dimensions_from_latest();
+        self.push_streaming_frame_if_available();
+        self.sync_preview_snapshot();
+        self.sync_mixer_snapshot();
         self.show_preview_viewport(ctx);
+        self.show_mixer_viewport(ctx);
         self.show_settings_window(ctx);
         self.show_first_run_window(ctx);
         self.save_settings_if_due();
@@ -1854,8 +3167,26 @@ impl eframe::App for YaoyorozuApp {
             .exact_height(38.0)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if ui.button("⚙ 設定").clicked() {
-                        self.settings_open = true;
+                    if ui
+                        .selectable_label(self.preview_window_open, "▣ プレビュー")
+                        .on_hover_text("プレビューウィンドウを開く / 閉じる")
+                        .clicked()
+                    {
+                        toggle_window_open(&mut self.preview_window_open);
+                    }
+                    if ui
+                        .selectable_label(self.mixer_window_open, "≡ ミキサー")
+                        .on_hover_text("音声ミキサーを開く / 閉じる")
+                        .clicked()
+                    {
+                        toggle_window_open(&mut self.mixer_window_open);
+                    }
+                    if ui
+                        .selectable_label(self.settings_open, "⚙ 設定")
+                        .on_hover_text("設定ウィンドウを開く / 閉じる")
+                        .clicked()
+                    {
+                        toggle_window_open(&mut self.settings_open);
                     }
                     ui.separator();
                     ui.strong("燕 / Tsubame");
@@ -1905,11 +3236,18 @@ impl eframe::App for YaoyorozuApp {
                     })
                     .unwrap_or((0.0, 0));
                 ui.label(format!(
-                    "CPU {:.1}% | RAM {:.0} MB | Capture {:.1} FPS | Preview Drop {}",
+                    "CPU {:.1}% | RAM {:.0} MB | {}",
                     self.performance.cpu_percent,
                     self.performance.memory_mb,
-                    capture_fps,
-                    preview_drops
+                    performance_pipeline_text(
+                        capture_fps,
+                        self.performance.preview_fps,
+                        self.performance.mixer_ui_fps,
+                        self.performance.mixer_meter_fps,
+                        self.performance.encode_input_fps,
+                        self.capture_target_fps,
+                        preview_drops,
+                    )
                 ));
                 ui.separator();
                 ui.label(self.streaming_target.connection_label());
@@ -2066,7 +3404,6 @@ impl eframe::App for YaoyorozuApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let levels = self.audio.as_ref().map(|a| a.levels()).unwrap_or_default();
             let content_height = ui.available_height();
 
             ui.horizontal_top(|ui| {
@@ -2080,10 +3417,6 @@ impl eframe::App for YaoyorozuApp {
                             .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.heading("プレビュー");
-                        let button_label = if self.preview_window_open { "閉じる" } else { "開く" };
-                        if ui.button(button_label).clicked() {
-                            self.preview_window_open = !self.preview_window_open;
-                        }
                         ui.small(format!("{}×{}", self.preview_size[0], self.preview_size[1]));
                     });
                     ui.small(if self.preview_window_open {
@@ -2264,6 +3597,13 @@ impl eframe::App for YaoyorozuApp {
                             .find(|layer| layer.id == selected_id && layer.kind == LayerKind::Audio)
                             .map(|layer| layer.id)
                     });
+                    let active_bgm_id = self
+                        .bgm_layers
+                        .iter()
+                        .find(|(id, _)| self.bgm_players.contains_key(id))
+                        .map(|(id, _)| *id);
+                    let bgm_control_layer_id =
+                        prefer_selected_or_active_bgm(selected_bgm_id, active_bgm_id);
                     let mut bgm_play = false;
                     let mut bgm_pause_resume = false;
                     let mut bgm_stop = false;
@@ -2271,7 +3611,7 @@ impl eframe::App for YaoyorozuApp {
                     let mut bgm_restart_for_loop = false;
                     let mut bgm_volume_change: Option<f32> = None;
                     let mut bgm_mute_change: Option<bool> = None;
-                    if let Some(bgm_layer_id) = selected_bgm_id {
+                    if let Some(bgm_layer_id) = bgm_control_layer_id {
                         if let Some(bgm_index) = self
                             .bgm_layers
                             .iter()
@@ -2334,13 +3674,29 @@ impl eframe::App for YaoyorozuApp {
                                 });
                         }
                     }
-                    if let Some(bgm_layer_id) = selected_bgm_id {
+                    if let Some(bgm_layer_id) = bgm_control_layer_id {
                         if let Some(volume) = bgm_volume_change {
                             if let Some(player) = self.bgm_players.get(&bgm_layer_id) {
                                 player.set_volume(volume);
                             }
+                            if let Some(channel_id) = self.bgm_audio_channels.get(&bgm_layer_id).copied() {
+                                if let Some((_, source)) = self
+                                    .bgm_layers
+                                    .iter()
+                                    .find(|(id, _)| *id == bgm_layer_id)
+                                {
+                                    if let Some(audio) = self.audio.as_ref() {
+                                        audio.set_channel_gain(channel_id, source.volume_linear());
+                                    }
+                                }
+                            }
                         }
                         if let Some(muted) = bgm_mute_change {
+                            if let Some(channel_id) = self.bgm_audio_channels.get(&bgm_layer_id).copied() {
+                                if let Some(audio) = self.audio.as_ref() {
+                                    audio.set_channel_muted(channel_id, muted);
+                                }
+                            }
                             self.bgm_message = if muted {
                                 "BGM: Mute ON".to_owned()
                             } else {
@@ -2480,428 +3836,6 @@ impl eframe::App for YaoyorozuApp {
                     },
                 );
 
-                ui.separator();
-
-                ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), content_height),
-                    egui::Layout::top_down(egui::Align::Min),
-                    |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt("audio_mixer_scroll")
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                    ui.heading("音声ミキサー");
-
-                    // Phase 8A: BGMはまだWindows既定出力経由だが、
-                    // ミキサーからGain/Muteを直接操作できるようにする。
-                    // Mix/WAVの直接ルーティングはPhase 8Bでstream-audioへ統合する。
-                    let bgm_mixer_snapshot: Vec<_> = self
-                        .bgm_layers
-                        .iter()
-                        .map(|(id, source)| {
-                            (
-                                *id,
-                                source.name.clone(),
-                                source.volume_percent,
-                                source.muted,
-                            )
-                        })
-                        .collect();
-                    let mut bgm_mixer_gain_changes: Vec<(LayerId, f32)> = Vec::new();
-                    let mut bgm_mixer_mute_changes: Vec<(LayerId, bool)> = Vec::new();
-                    let mut bgm_mixer_remove: Option<LayerId> = None;
-
-                    if let Some(audio) = &self.audio {
-                        let settings = audio.mixer_settings();
-                        let output_devices = audio.output_devices();
-                        let input_devices = audio.input_devices();
-                        let device_switch_enabled = self.recording.is_none()
-                            && self.finalize_rx.is_none()
-                            && self.streaming.is_none();
-                        let all_channels = audio.audio_channels();
-                        let desktop_channel = all_channels
-                            .iter()
-                            .find(|channel| channel.id == ChannelMixerControl::DESKTOP_ID)
-                            .cloned();
-                        let microphone_channel = all_channels
-                            .iter()
-                            .find(|channel| channel.id == ChannelMixerControl::MICROPHONE_ID)
-                            .cloned();
-                        let application_channels: Vec<_> = all_channels
-                            .into_iter()
-                            .filter(|channel| channel.kind == AudioChannelKind::Application)
-                            .collect();
-
-                        // Mixer stripには長いWASAPIステータス文字列をそのまま出さない。
-                        // Windows既定を使っている場合は短い「Win規定」に統一して、
-                        // PC音声 / マイク / Master の3段目の高さを揃える。
-                        let selected_output = audio.selected_output_device();
-                        let desktop_source_label = match &selected_output {
-                            AudioDeviceSelection::Default => "Win規定".to_owned(),
-                            AudioDeviceSelection::DeviceId(_) => compact_source_name(
-                                &selection_label(&selected_output, &output_devices),
-                                10,
-                            ),
-                        };
-                        let selected_input = audio.selected_input_device();
-                        let microphone_source_label = match &selected_input {
-                            AudioDeviceSelection::Default => "Win規定".to_owned(),
-                            AudioDeviceSelection::DeviceId(_) => compact_source_name(
-                                &selection_label(&selected_input, &input_devices),
-                                10,
-                            ),
-                        };
-
-                        ui.small("同一サイズのチャンネルストリップ / PC・マイク・BGM・アプリ音声・Masterを同じ基準で表示します");
-                        ui.add_space(4.0);
-
-                        let mut remove_channel = None;
-                        egui::ScrollArea::horizontal()
-                            .id_salt("vertical_audio_mixer_channels")
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                ui.horizontal_top(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 4.0;
-
-                                    let desktop_strip = draw_mixer_channel_strip(
-                                        ui,
-                                        MixerStripModel {
-                                            title: "PC音声".to_owned(),
-                                            source: desktop_source_label,
-                                            level: levels.desktop,
-                                            gain_percent: settings.desktop_gain * 100.0,
-                                            mute: Some(settings.desktop_muted),
-                                            mix: desktop_channel.as_ref().map(|c| c.include_in_stream_mix),
-                                            wav: desktop_channel.as_ref().map(|c| c.record_individual),
-                                            removable: false,
-                                        },
-                                    );
-                                    if desktop_strip.gain_changed {
-                                        audio.set_desktop_gain(desktop_strip.gain_percent / 100.0);
-                                    }
-                                    if desktop_strip.mute != Some(settings.desktop_muted) {
-                                        if let Some(muted) = desktop_strip.mute {
-                                            audio.set_desktop_muted(muted);
-                                        }
-                                    }
-                                    if let Some(channel) = &desktop_channel {
-                                        if desktop_strip.mix != Some(channel.include_in_stream_mix) {
-                                            if let Some(in_mix) = desktop_strip.mix {
-                                                audio.set_channel_include_in_stream_mix(channel.id, in_mix);
-                                            }
-                                        }
-                                        if desktop_strip.wav != Some(channel.record_individual) {
-                                            if let Some(record) = desktop_strip.wav {
-                                                audio.set_channel_record_individual(channel.id, record);
-                                            }
-                                        }
-                                    }
-
-                                    let microphone_strip = draw_mixer_channel_strip(
-                                        ui,
-                                        MixerStripModel {
-                                            title: "マイク".to_owned(),
-                                            source: microphone_source_label,
-                                            level: levels.mic,
-                                            gain_percent: settings.mic_gain * 100.0,
-                                            mute: Some(settings.mic_muted),
-                                            mix: microphone_channel.as_ref().map(|c| c.include_in_stream_mix),
-                                            wav: microphone_channel.as_ref().map(|c| c.record_individual),
-                                            removable: false,
-                                        },
-                                    );
-                                    if microphone_strip.gain_changed {
-                                        audio.set_mic_gain(microphone_strip.gain_percent / 100.0);
-                                    }
-                                    if microphone_strip.mute != Some(settings.mic_muted) {
-                                        if let Some(muted) = microphone_strip.mute {
-                                            audio.set_mic_muted(muted);
-                                        }
-                                    }
-                                    if let Some(channel) = &microphone_channel {
-                                        if microphone_strip.mix != Some(channel.include_in_stream_mix) {
-                                            if let Some(in_mix) = microphone_strip.mix {
-                                                audio.set_channel_include_in_stream_mix(channel.id, in_mix);
-                                            }
-                                        }
-                                        if microphone_strip.wav != Some(channel.record_individual) {
-                                            if let Some(record) = microphone_strip.wav {
-                                                audio.set_channel_record_individual(channel.id, record);
-                                            }
-                                        }
-                                    }
-
-                                    for (bgm_id, bgm_name, volume_percent, muted) in &bgm_mixer_snapshot {
-                                        let bgm_strip = draw_mixer_channel_strip(
-                                            ui,
-                                            MixerStripModel {
-                                                title: "BGM".to_owned(),
-                                                source: bgm_name.clone(),
-                                                // Phase 8AではPCMメーターはまだstream-audio未統合。
-                                                // ストリップ構造を先に統一し、実レベルは8Bで接続する。
-                                                level: 0.0,
-                                                gain_percent: *volume_percent,
-                                                mute: Some(*muted),
-                                                mix: None,
-                                                wav: None,
-                                                removable: true,
-                                            },
-                                        );
-                                        if bgm_strip.gain_changed {
-                                            bgm_mixer_gain_changes.push((*bgm_id, bgm_strip.gain_percent));
-                                        }
-                                        if bgm_strip.mute != Some(*muted) {
-                                            if let Some(new_muted) = bgm_strip.mute {
-                                                bgm_mixer_mute_changes.push((*bgm_id, new_muted));
-                                            }
-                                        }
-                                        if bgm_strip.remove_clicked {
-                                            bgm_mixer_remove = Some(*bgm_id);
-                                        }
-                                    }
-
-                                    for channel in &application_channels {
-                                        let source = channel
-                                            .process_id
-                                            .map(|pid| format!("PID {pid}"))
-                                            .unwrap_or_else(|| "アプリ音声".to_owned());
-                                        let app_strip = draw_mixer_channel_strip(
-                                            ui,
-                                            MixerStripModel {
-                                                title: channel.name.clone(),
-                                                source,
-                                                level: channel.current_level,
-                                                gain_percent: channel.gain * 100.0,
-                                                mute: Some(channel.muted),
-                                                mix: Some(channel.include_in_stream_mix),
-                                                wav: Some(channel.record_individual),
-                                                removable: true,
-                                            },
-                                        );
-                                        if app_strip.gain_changed {
-                                            audio.set_channel_gain(channel.id, app_strip.gain_percent / 100.0);
-                                        }
-                                        if app_strip.mute != Some(channel.muted) {
-                                            if let Some(muted) = app_strip.mute {
-                                                audio.set_channel_muted(channel.id, muted);
-                                            }
-                                        }
-                                        if app_strip.mix != Some(channel.include_in_stream_mix) {
-                                            if let Some(in_mix) = app_strip.mix {
-                                                audio.set_channel_include_in_stream_mix(channel.id, in_mix);
-                                            }
-                                        }
-                                        if app_strip.wav != Some(channel.record_individual) {
-                                            if let Some(record) = app_strip.wav {
-                                                audio.set_channel_record_individual(channel.id, record);
-                                            }
-                                        }
-                                        if app_strip.remove_clicked {
-                                            remove_channel = Some(channel.id);
-                                        }
-                                    }
-
-                                    let master_strip = draw_mixer_channel_strip(
-                                        ui,
-                                        MixerStripModel {
-                                            title: "Master".to_owned(),
-                                            source: "配信Mix".to_owned(),
-                                            level: levels.mix,
-                                            gain_percent: settings.master_gain * 100.0,
-                                            mute: None,
-                                            mix: None,
-                                            wav: None,
-                                            removable: false,
-                                        },
-                                    );
-                                    if master_strip.gain_changed {
-                                        audio.set_master_gain(master_strip.gain_percent / 100.0);
-                                    }
-                                });
-                            });
-
-                        if let Some(id) = remove_channel {
-                            audio.remove_audio_channel(id);
-                        }
-
-                        ui.add_space(6.0);
-                        egui::CollapsingHeader::new("音声入出力・アプリ追加")
-                            .id_salt("audio_io_controls")
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                ui.columns(2, |columns| {
-                                    columns[0].label("PC音声デバイス");
-                                    let selected_output = audio.selected_output_device();
-                                    columns[0].add_enabled_ui(device_switch_enabled, |ui| {
-                                        egui::ComboBox::from_id_salt("phase9_desktop_audio_device")
-                                            .width(220.0)
-                                            .selected_text(selection_label(&selected_output, &output_devices))
-                                            .show_ui(ui, |ui| {
-                                                if ui.selectable_label(
-                                                    selected_output == AudioDeviceSelection::Default,
-                                                    "Windows既定",
-                                                ).clicked() {
-                                                    audio.set_output_device(AudioDeviceSelection::Default);
-                                                }
-                                                for device in &output_devices {
-                                                    let selection = AudioDeviceSelection::DeviceId(device.id.clone());
-                                                    if ui.selectable_label(selected_output == selection, &device.name).clicked() {
-                                                        audio.set_output_device(selection);
-                                                    }
-                                                }
-                                            });
-                                    });
-
-                                    columns[1].label("マイクデバイス");
-                                    let selected_input = audio.selected_input_device();
-                                    columns[1].add_enabled_ui(device_switch_enabled, |ui| {
-                                        egui::ComboBox::from_id_salt("phase9_microphone_audio_device")
-                                            .width(220.0)
-                                            .selected_text(selection_label(&selected_input, &input_devices))
-                                            .show_ui(ui, |ui| {
-                                                if ui.selectable_label(
-                                                    selected_input == AudioDeviceSelection::Default,
-                                                    "Windows既定",
-                                                ).clicked() {
-                                                    audio.set_input_device(AudioDeviceSelection::Default);
-                                                }
-                                                for device in &input_devices {
-                                                    let selection = AudioDeviceSelection::DeviceId(device.id.clone());
-                                                    if ui.selectable_label(selected_input == selection, &device.name).clicked() {
-                                                        audio.set_input_device(selection);
-                                                    }
-                                                }
-                                            });
-                                    });
-                                });
-
-                                ui.separator();
-                                let app_sources = audio.application_sources();
-                                let selected_app_label = self
-                                    .selected_application_audio_pid
-                                    .and_then(|pid| app_sources.iter().find(|source| source.capture_process_id == pid))
-                                    .map(application_source_label)
-                                    .unwrap_or_else(|| "アプリ音声を選択".to_owned());
-
-                                ui.horizontal(|ui| {
-                                    egui::ComboBox::from_id_salt("phase9_application_audio_source")
-                                        .width(220.0)
-                                        .selected_text(compact_source_name(&selected_app_label, 28))
-                                        .show_ui(ui, |ui| {
-                                            if app_sources.is_empty() {
-                                                ui.label("音声を使用中のアプリがありません");
-                                            }
-                                            for source in &app_sources {
-                                                let label = application_source_label(source);
-                                                if ui.selectable_label(
-                                                    self.selected_application_audio_pid == Some(source.capture_process_id),
-                                                    &label,
-                                                ).on_hover_text(&label).clicked() {
-                                                    self.selected_application_audio_pid = Some(source.capture_process_id);
-                                                }
-                                            }
-                                        });
-
-                                    let selected_source = self
-                                        .selected_application_audio_pid
-                                        .and_then(|pid| app_sources.iter().find(|source| source.capture_process_id == pid).cloned());
-                                    if ui.add_enabled(
-                                        selected_source.is_some() && device_switch_enabled,
-                                        egui::Button::new("＋ アプリ音声"),
-                                    ).clicked() {
-                                        if let Some(source) = selected_source {
-                                            match audio.add_application_channel(source) {
-                                                Ok(_) => {
-                                                    self.application_audio_message =
-                                                        "アプリ音声チャンネルを追加しました".to_owned();
-                                                }
-                                                Err(err) => {
-                                                    self.application_audio_message =
-                                                        format!("アプリ音声追加失敗: {err}");
-                                                }
-                                            }
-                                        }
-                                    }
-                                });
-
-                                ui.horizontal(|ui| {
-                                    if ui.add_enabled(device_switch_enabled, egui::Button::new("アプリ音声一覧更新")).clicked() {
-                                        match audio.refresh_application_sources() {
-                                            Ok(()) => {
-                                                self.application_audio_message =
-                                                    "アプリ音声一覧を更新しました".to_owned();
-                                            }
-                                            Err(err) => {
-                                                self.application_audio_message =
-                                                    format!("アプリ音声一覧更新失敗: {err}");
-                                            }
-                                        }
-                                    }
-                                    if ui.add_enabled(device_switch_enabled, egui::Button::new("音声デバイス更新")).clicked() {
-                                        match audio.refresh_devices() {
-                                            Ok(()) => {
-                                                self.audio_message = "音声デバイス一覧を更新しました".to_owned();
-                                            }
-                                            Err(err) => {
-                                                self.audio_message = format!("デバイス更新失敗: {err}");
-                                            }
-                                        }
-                                    }
-                                });
-                                ui.small(&self.application_audio_message);
-                                ui.small(&self.audio_message);
-                                if !device_switch_enabled {
-                                    ui.small(if self.streaming.is_some() {
-                                        "配信中は音声デバイスとアプリ構成を固定します"
-                                    } else {
-                                        "録画中は音声デバイスとアプリ構成を固定します"
-                                    });
-                                }
-                            });
-
-                        egui::CollapsingHeader::new("音声ルーティング説明")
-                            .id_salt("audio_routing_help")
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                ui.small("個別WAVは原音のまま保存（Gain/Muteは非破壊）");
-                                ui.small("Mix ONのチャンネルだけ完成MP4・配信Mixへ合流");
-                                ui.small("個別WAV保存 OFFでもMix用の一時原音は録画後に自動削除");
-                            });
-                    } else {
-                        ui.label("音声デバイスを取得できていません");
-                    }
-
-                    // BGM操作はaudioへの借用を解放してから反映する。
-                    for (id, gain_percent) in bgm_mixer_gain_changes {
-                        if let Some((_, source)) = self.bgm_layers.iter_mut().find(|(layer_id, _)| *layer_id == id) {
-                            source.volume_percent = gain_percent.clamp(0.0, 100.0);
-                            if let Some(player) = self.bgm_players.get(&id) {
-                                player.set_volume(source.effective_volume());
-                            }
-                        }
-                    }
-                    for (id, muted) in bgm_mixer_mute_changes {
-                        if let Some((_, source)) = self.bgm_layers.iter_mut().find(|(layer_id, _)| *layer_id == id) {
-                            source.muted = muted;
-                            if let Some(player) = self.bgm_players.get(&id) {
-                                player.set_volume(source.effective_volume());
-                            }
-                        }
-                    }
-                    if let Some(id) = bgm_mixer_remove {
-                        self.remove_bgm_layer(id);
-                        self.bgm_message = if self.bgm_layers.is_empty() {
-                            "BGM: 未追加".to_owned()
-                        } else {
-                            format!("BGM削除 / 残り {} 曲", self.bgm_layers.len())
-                        };
-                    }
-
-                    ui.small("BGMのMix/WAVと実レベルメーターはPhase 8Bで直接PCM統合します");
-                    ui.small(&self.audio_message);
-                            });
-                    },
-                );
             });
         });
 
@@ -2909,23 +3843,109 @@ impl eframe::App for YaoyorozuApp {
             self.elapsed_ms = self.elapsed_ms.saturating_add(16);
         }
 
-        let repaint_ms = if self.streaming.is_some() {
-            // Live input readback currently runs at 30 FPS, so repainting the
-            // egui control surface at 60 FPS only burns CPU without adding frames.
-            33
-        } else if self.preview_window_open {
-            // Preview editing remains smooth enough at 30 FPS.
-            33
-        } else if self.recording.is_some() {
-            match self.recording_preview_mode {
-                PreviewMode::Fps30 => 33,
-                PreviewMode::Fps15 => 66,
-                PreviewMode::Off => 250,
-            }
-        } else {
-            // Idle + hidden preview: meters/status do not need game-frame cadence.
-            100
-        };
-        ctx.request_repaint_after(std::time::Duration::from_millis(repaint_ms));
+        // Main controls, deferred preview, and deferred mixer no longer share the same repaint clock.
+        // Sync controls changed during this pass, then let child viewports continue
+        // at their own repaint cadences.
+        self.sync_preview_snapshot();
+        let repaint_ms = main_ui_repaint_ms(
+            self.streaming.is_some(),
+            self.preview_window_open,
+            self.recording.is_some(),
+            self.recording_preview_mode,
+        );
+        ctx.request_repaint_after(Duration::from_millis(repaint_ms));
     }
+}
+
+#[cfg(test)]
+mod toolbar_tests {
+    use super::{
+        main_ui_repaint_ms, measured_fps, mixer_meter_refresh_due, mixer_ui_repaint_ms,
+        performance_pipeline_text, prefer_selected_or_active_bgm, toggle_window_open,
+        RuntimeFrameCounters,
+    };
+    use std::time::{Duration, Instant};
+    use stream_capture::PreviewMode;
+
+    #[test]
+    fn toolbar_toggle_flips_auxiliary_window_state_both_ways() {
+        let mut open = false;
+        toggle_window_open(&mut open);
+        assert!(open);
+        toggle_window_open(&mut open);
+        assert!(!open);
+    }
+    #[test]
+    fn deferred_preview_does_not_force_main_ui_to_30fps() {
+        assert_eq!(
+            main_ui_repaint_ms(false, false, false, PreviewMode::Fps15),
+            100
+        );
+        assert_eq!(
+            main_ui_repaint_ms(false, true, false, PreviewMode::Fps15),
+            100
+        );
+    }
+
+    #[test]
+    fn deferred_mixer_uses_independent_meter_repaint_period() {
+        assert_eq!(mixer_ui_repaint_ms(true), 33);
+        assert_eq!(mixer_ui_repaint_ms(false), 250);
+    }
+
+    #[test]
+    fn mixer_meter_refresh_is_capped_at_about_30hz() {
+        let start = Instant::now();
+        assert!(mixer_meter_refresh_due(None, start));
+        assert!(!mixer_meter_refresh_due(Some(start), start + Duration::from_millis(20)));
+        assert!(mixer_meter_refresh_due(Some(start), start + Duration::from_millis(34)));
+    }
+
+    #[test]
+    fn performance_labels_distinguish_encode_input_from_target_fps() {
+        let text = performance_pipeline_text(24.2, 0.0, 58.1, 29.7, 23.6, 60, 0);
+        assert!(text.contains("Capture 24.2 FPS"));
+        assert!(text.contains("Mixer Render 58.1 FPS"));
+        assert!(text.contains("Meter 29.7 FPS"));
+        assert!(text.contains("Encode In 23.6 FPS"));
+        assert!(text.contains("Target 60 FPS"));
+    }
+
+    #[test]
+    fn active_bgm_controls_remain_available_when_layer_selection_changes() {
+        assert_eq!(prefer_selected_or_active_bgm(Some(10_u64), Some(20_u64)), Some(10));
+        assert_eq!(prefer_selected_or_active_bgm(None, Some(20_u64)), Some(20));
+        assert_eq!(prefer_selected_or_active_bgm::<u64>(None, None), None);
+    }
+
+    #[test]
+    fn measured_fps_uses_actual_elapsed_time() {
+        let fps = measured_fps(45, 15, Duration::from_millis(1500));
+        assert!((fps - 20.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn runtime_frame_counters_track_each_pipeline_independently() {
+        let counters = RuntimeFrameCounters::default();
+        counters.count_preview_ui_frame();
+        counters.count_preview_ui_frame();
+        counters.count_mixer_ui_frame();
+        counters.count_mixer_meter_update();
+        counters.count_streaming_output_frame();
+        counters.count_streaming_output_frame();
+        counters.count_streaming_output_frame();
+
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.preview_ui_frames, 2);
+        assert_eq!(snapshot.mixer_ui_frames, 1);
+        assert_eq!(snapshot.mixer_meter_updates, 1);
+        assert_eq!(snapshot.streaming_output_frames, 3);
+    }
+
+    #[test]
+    fn audio_worker_can_be_shared_with_deferred_mixer() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<stream_audio::AudioWorker>();
+    }
+
 }

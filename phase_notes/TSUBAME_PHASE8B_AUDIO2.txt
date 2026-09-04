@@ -1,0 +1,9 @@
+Phase 8B-Audio.2
+
+BGM direct PCM recording integration:
+- synchronized external PCM WAV recording
+- silence padding for timeline alignment
+- final recording mux includes BGM according to Mix
+- BGM WAV checkbox preserves/removes individual BGM WAV
+
+Cargo/Rust is not available in the patch-generation environment, so build/test must be run on the Windows development machine.

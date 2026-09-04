@@ -1,0 +1,3 @@
+Phase 8B-UI.2: Top icon toolbar
+Base: Phase 8B-UI.1
+Changed: apps/tsubame/src/app.rs only

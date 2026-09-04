@@ -1,0 +1,11 @@
+燕 / Tsubame Phase 8B-Perf.4
+
+目的:
+- ミキサー窓の再描画回数と、実際の音声メーター更新回数を分離
+- メーター値取得を約30Hz上限にしてCPU負荷を抑える
+- 実測値の意味を正確にするため Output を Encode In / Target に分離
+
+主な表示:
+Capture / Preview / Mixer Render / Meter / Encode In / Target / Drop
+
+BGM直接PCM Mixは次フェーズ。

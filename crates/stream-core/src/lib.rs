@@ -82,7 +82,7 @@ pub struct EditManifest {
 impl EditManifest {
     pub fn new(session: SessionConfig) -> Self {
         Self {
-            format: "yaoyorozu_stream_edit".into(),
+            format: "tsubame_stream_edit".into(),
             version: 1,
             session,
             media: MediaPaths::default(),

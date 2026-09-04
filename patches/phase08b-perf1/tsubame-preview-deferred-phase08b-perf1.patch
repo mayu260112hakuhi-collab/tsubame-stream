@@ -1,0 +1,1396 @@
+--- a/apps/tsubame/src/app.rs
++++ b/apps/tsubame/src/app.rs
+@@ -15,14 +15,16 @@
+     collections::HashMap,
+     fs,
+     path::PathBuf,
+-    sync::mpsc,
++    sync::{mpsc, Arc, Mutex, RwLock},
+     time::{Duration, Instant},
+ };
+ use stream_audio::{
+     application_source_label, dbfs, selection_label, AudioChannelKind, AudioDeviceSelection,
+     AudioWorker, ChannelMixerControl, MixerControl,
+ };
+-use stream_capture::{enumerate_windows, CaptureSource, CaptureWorker, PreviewMode, WindowInfo};
++use stream_capture::{
++    enumerate_windows, CaptureSource, CaptureWorker, LatestFrameSnapshot, PreviewMode, WindowInfo,
++};
+ use stream_core::{MarkerKind, StreamPreset};
+ use stream_recording::{
+     ffmpeg_location_string, EncoderPreference, RecordingConfig, RecordingPaths, RecordingSession,
+@@ -439,6 +441,472 @@
+ }
+ 
+ 
++#[derive(Clone)]
++struct PreviewRenderSnapshot {
++    layers: Vec<SceneLayer>,
++    overlay_source: OverlaySource,
++    image_overlays: Vec<(LayerId, ImageOverlaySource)>,
++    selected_layer: Option<LayerId>,
++    fish_layer_id: LayerId,
++    app_started_at: Instant,
++}
++
++impl PreviewRenderSnapshot {
++    fn layer_locked(&self, id: LayerId) -> bool {
++        self.layers
++            .iter()
++            .find(|layer| layer.id == id)
++            .map(|layer| layer.locked)
++            .unwrap_or(false)
++    }
++}
++
++#[derive(Debug, Clone, Copy)]
++enum PreviewViewportCommand {
++    Close,
++    Geometry {
++        position: Option<[f32; 2]>,
++        size: Option<[f32; 2]>,
++    },
++    Select(Option<LayerId>),
++    Move {
++        layer_id: LayerId,
++        delta_x: f32,
++        delta_y: f32,
++        preview_width: f32,
++        preview_height: f32,
++        source_width: u32,
++        source_height: u32,
++    },
++    Resize {
++        layer_id: LayerId,
++        delta_x: f32,
++        preview_width: f32,
++        source_width: u32,
++        source_height: u32,
++    },
++}
++
++#[derive(Default)]
++struct DeferredPreviewUiState {
++    texture: Option<egui::TextureHandle>,
++    resize_drag_layer: Option<LayerId>,
++    last_window_position: Option<[f32; 2]>,
++    last_window_size: Option<[f32; 2]>,
++}
++
++fn main_ui_repaint_ms(
++    streaming: bool,
++    _preview_open: bool,
++    recording: bool,
++    recording_preview_mode: PreviewMode,
++) -> u64 {
++    if streaming {
++        // Streaming still pushes CPU-readable preview frames from the app loop.
++        // The streaming path will be detached from the UI in a later perf phase.
++        33
++    } else if recording {
++        match recording_preview_mode {
++            PreviewMode::Fps30 => 33,
++            PreviewMode::Fps15 => 66,
++            PreviewMode::Off => 250,
++        }
++    } else {
++        // Deferred preview viewports repaint themselves. An open preview must
++        // not force the main control surface to 30 FPS anymore.
++        100
++    }
++}
++
++fn compose_preview_frame(
++    frame: stream_capture::CaptureFrame,
++    snapshot: &PreviewRenderSnapshot,
++) -> stream_capture::CaptureFrame {
++    let overlay_enabled = snapshot.layers.iter().any(|layer| match layer.kind {
++        LayerKind::FishOverlay if layer.id == snapshot.fish_layer_id => {
++            snapshot.overlay_source.enabled
++        }
++        LayerKind::Image => snapshot
++            .image_overlays
++            .iter()
++            .find(|(id, _)| *id == layer.id)
++            .is_some_and(|(_, overlay)| overlay.enabled),
++        _ => false,
++    });
++
++    if !overlay_enabled {
++        return frame;
++    }
++
++    let mut composed_rgba = frame.rgba.to_vec();
++    for layer in &snapshot.layers {
++        match layer.kind {
++            LayerKind::FishOverlay if layer.id == snapshot.fish_layer_id => {
++                snapshot.overlay_source.compose_test_overlay(
++                    &mut composed_rgba,
++                    frame.width,
++                    frame.height,
++                    snapshot.app_started_at.elapsed().as_secs_f32(),
++                );
++            }
++            LayerKind::Image => {
++                if let Some((_, image_overlay)) = snapshot
++                    .image_overlays
++                    .iter()
++                    .find(|(id, _)| *id == layer.id)
++                {
++                    image_overlay.compose(&mut composed_rgba, frame.width, frame.height);
++                }
++            }
++            _ => {}
++        }
++    }
++
++    stream_capture::CaptureFrame {
++        sequence: frame.sequence,
++        width: frame.width,
++        height: frame.height,
++        rgba: Arc::<[u8]>::from(composed_rgba),
++    }
++}
++
++fn send_preview_command(
++    ctx: &egui::Context,
++    tx: &mpsc::Sender<PreviewViewportCommand>,
++    command: PreviewViewportCommand,
++) {
++    if tx.send(command).is_ok() {
++        ctx.request_repaint_of(egui::ViewportId::ROOT);
++    }
++}
++
++fn geometry_changed(a: Option<[f32; 2]>, b: Option<[f32; 2]>) -> bool {
++    match (a, b) {
++        (Some(a), Some(b)) => (a[0] - b[0]).abs() > 0.5 || (a[1] - b[1]).abs() > 0.5,
++        (None, None) => false,
++        _ => true,
++    }
++}
++
++fn draw_deferred_preview_canvas(
++    preview_ctx: &egui::Context,
++    ui: &mut egui::Ui,
++    outer_size: egui::Vec2,
++    snapshot: &PreviewRenderSnapshot,
++    latest_frame: Option<&stream_capture::LatestFrameSnapshot>,
++    streamed_frame: Option<&Arc<RwLock<Option<stream_capture::CaptureFrame>>>>,
++    ui_state: &Arc<Mutex<DeferredPreviewUiState>>,
++    command_tx: &mpsc::Sender<PreviewViewportCommand>,
++) {
++    let desired = egui::vec2(outer_size.x.max(120.0), outer_size.y.max(120.0));
++    let (outer, outer_response) = ui.allocate_exact_size(desired, egui::Sense::click());
++    ui.painter()
++        .rect_filled(outer, 4.0, egui::Color32::from_rgb(18, 20, 24));
++
++    // While streaming, reuse the exact composited frame already sent to the
++    // streamer. That keeps deferred preview from compositing overlays a second
++    // time at 30 FPS. Outside streaming, compose from the non-consuming latest
++    // capture snapshot so the main UI can remain asleep.
++    let streamed = streamed_frame.and_then(|shared| {
++        shared
++            .read()
++            .ok()
++            .and_then(|frame| frame.as_ref().cloned())
++    });
++    let composed_frame = if let Some(frame) = streamed {
++        frame
++    } else {
++        let Some(frame) = latest_frame.and_then(|latest| latest.latest_frame()) else {
++            ui.painter().text(
++                outer.center(),
++                egui::Align2::CENTER_CENTER,
++                "キャプチャ待機中…",
++                egui::FontId::proportional(16.0),
++                egui::Color32::LIGHT_GRAY,
++            );
++            return;
++        };
++        compose_preview_frame(frame, snapshot)
++    };
++
++    let source_size = [composed_frame.width, composed_frame.height];
++    let image = egui::ColorImage::from_rgba_unmultiplied(
++        [composed_frame.width as usize, composed_frame.height as usize],
++        &composed_frame.rgba,
++    );
++
++    let texture_id = {
++        let Ok(mut state) = ui_state.lock() else {
++            return;
++        };
++        if let Some(texture) = &mut state.texture {
++            texture.set(image, egui::TextureOptions::LINEAR);
++        } else {
++            state.texture = Some(preview_ctx.load_texture(
++                "capture-preview-deferred",
++                image,
++                egui::TextureOptions::LINEAR,
++            ));
++        }
++        state.texture.as_ref().map(|texture| texture.id())
++    };
++
++    let Some(texture_id) = texture_id else {
++        return;
++    };
++
++    let (draw_w, draw_h) = fit_aspect(
++        source_size[0] as f32,
++        source_size[1] as f32,
++        outer.width(),
++        outer.height(),
++    );
++    let image_rect = egui::Rect::from_center_size(outer.center(), egui::vec2(draw_w, draw_h));
++    ui.painter().image(
++        texture_id,
++        image_rect,
++        egui::Rect::from_min_max(egui::Pos2::new(0.0, 0.0), egui::Pos2::new(1.0, 1.0)),
++        egui::Color32::WHITE,
++    );
++
++    let mut overlay_interacted = false;
++
++    if snapshot.overlay_source.enabled && source_size[0] > 0 && source_size[1] > 0 {
++        let fish_locked = snapshot.layer_locked(snapshot.fish_layer_id);
++        let fish_w = image_rect.width() * snapshot.overlay_source.width_percent / 100.0;
++        let fish_h = fish_w * 0.42;
++        let bounce = if snapshot.overlay_source.bounce {
++            (snapshot.app_started_at.elapsed().as_secs_f32() * 4.2)
++                .sin()
++                .abs()
++                * image_rect.height()
++                * 0.055
++        } else {
++            0.0
++        };
++        let center = egui::pos2(
++            image_rect.left() + image_rect.width() * snapshot.overlay_source.x_percent / 100.0,
++            image_rect.top() + image_rect.height() * snapshot.overlay_source.y_percent / 100.0
++                - bounce,
++        );
++        let fish_rect = egui::Rect::from_center_size(center, egui::vec2(fish_w, fish_h));
++        let hit_rect = fish_rect.expand(5.0).intersect(image_rect);
++        let fish_response = ui.interact(
++            hit_rect,
++            ui.id().with("overlay_fish_drag_deferred"),
++            egui::Sense::click_and_drag(),
++        );
++        let handle_size = 12.0;
++        let handle_rect = egui::Rect::from_center_size(
++            fish_rect.right_bottom(),
++            egui::vec2(handle_size, handle_size),
++        );
++
++        if fish_response.clicked() {
++            overlay_interacted = true;
++            send_preview_command(
++                preview_ctx,
++                command_tx,
++                PreviewViewportCommand::Select(Some(snapshot.fish_layer_id)),
++            );
++        }
++        if fish_response.drag_started() {
++            overlay_interacted = true;
++            let resize = !fish_locked
++                && preview_ctx
++                    .pointer_interact_pos()
++                    .map(|p| handle_rect.expand(5.0).contains(p))
++                    .unwrap_or(false);
++            if let Ok(mut state) = ui_state.lock() {
++                state.resize_drag_layer = resize.then_some(snapshot.fish_layer_id);
++            }
++            send_preview_command(
++                preview_ctx,
++                command_tx,
++                PreviewViewportCommand::Select(Some(snapshot.fish_layer_id)),
++            );
++        }
++        if fish_response.dragged() {
++            overlay_interacted = true;
++            if !fish_locked {
++                let delta = preview_ctx.input(|i| i.pointer.delta());
++                let resize = ui_state
++                    .lock()
++                    .ok()
++                    .and_then(|state| state.resize_drag_layer)
++                    == Some(snapshot.fish_layer_id);
++                let command = if resize {
++                    PreviewViewportCommand::Resize {
++                        layer_id: snapshot.fish_layer_id,
++                        delta_x: delta.x,
++                        preview_width: image_rect.width(),
++                        source_width: source_size[0],
++                        source_height: source_size[1],
++                    }
++                } else {
++                    PreviewViewportCommand::Move {
++                        layer_id: snapshot.fish_layer_id,
++                        delta_x: delta.x,
++                        delta_y: delta.y,
++                        preview_width: image_rect.width(),
++                        preview_height: image_rect.height(),
++                        source_width: source_size[0],
++                        source_height: source_size[1],
++                    }
++                };
++                send_preview_command(preview_ctx, command_tx, command);
++            }
++        }
++        if fish_response.drag_stopped() {
++            if let Ok(mut state) = ui_state.lock() {
++                state.resize_drag_layer = None;
++            }
++        }
++
++        if snapshot.selected_layer == Some(snapshot.fish_layer_id) {
++            let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(100, 190, 255));
++            ui.painter()
++                .rect_stroke(fish_rect, 2.0, stroke, egui::StrokeKind::Outside);
++            ui.painter().rect_filled(
++                handle_rect,
++                1.0,
++                egui::Color32::from_rgb(100, 190, 255),
++            );
++        }
++    }
++
++    let image_layer_ids: Vec<LayerId> = snapshot
++        .layers
++        .iter()
++        .rev()
++        .filter(|layer| layer.kind == LayerKind::Image)
++        .map(|layer| layer.id)
++        .collect();
++
++    for image_layer_id in image_layer_ids {
++        let image_locked = snapshot.layer_locked(image_layer_id);
++        let Some((_, image_overlay)) = snapshot
++            .image_overlays
++            .iter()
++            .find(|(id, _)| *id == image_layer_id)
++        else {
++            continue;
++        };
++        if !image_overlay.enabled || source_size[0] == 0 || source_size[1] == 0 {
++            continue;
++        }
++
++        let overlay_w = image_rect.width() * image_overlay.width_percent / 100.0;
++        let overlay_h = overlay_w * image_overlay.aspect();
++        let center = egui::pos2(
++            image_rect.left() + image_rect.width() * image_overlay.x_percent / 100.0,
++            image_rect.top() + image_rect.height() * image_overlay.y_percent / 100.0,
++        );
++        let overlay_rect = egui::Rect::from_center_size(center, egui::vec2(overlay_w, overlay_h));
++        let hit_rect = overlay_rect.expand(5.0).intersect(image_rect);
++        let image_response = ui.interact(
++            hit_rect,
++            ui.id().with(("overlay_image_drag_deferred", image_layer_id)),
++            egui::Sense::click_and_drag(),
++        );
++        let handle_size = 12.0;
++        let handle_rect = egui::Rect::from_center_size(
++            overlay_rect.right_bottom(),
++            egui::vec2(handle_size, handle_size),
++        );
++
++        if image_response.clicked() {
++            overlay_interacted = true;
++            send_preview_command(
++                preview_ctx,
++                command_tx,
++                PreviewViewportCommand::Select(Some(image_layer_id)),
++            );
++        }
++        if image_response.drag_started() {
++            overlay_interacted = true;
++            let resize = !image_locked
++                && preview_ctx
++                    .pointer_interact_pos()
++                    .map(|p| handle_rect.expand(5.0).contains(p))
++                    .unwrap_or(false);
++            if let Ok(mut state) = ui_state.lock() {
++                state.resize_drag_layer = resize.then_some(image_layer_id);
++            }
++            send_preview_command(
++                preview_ctx,
++                command_tx,
++                PreviewViewportCommand::Select(Some(image_layer_id)),
++            );
++        }
++        if image_response.dragged() {
++            overlay_interacted = true;
++            if !image_locked {
++                let delta = preview_ctx.input(|i| i.pointer.delta());
++                let resize = ui_state
++                    .lock()
++                    .ok()
++                    .and_then(|state| state.resize_drag_layer)
++                    == Some(image_layer_id);
++                let command = if resize {
++                    PreviewViewportCommand::Resize {
++                        layer_id: image_layer_id,
++                        delta_x: delta.x,
++                        preview_width: image_rect.width(),
++                        source_width: source_size[0],
++                        source_height: source_size[1],
++                    }
++                } else {
++                    PreviewViewportCommand::Move {
++                        layer_id: image_layer_id,
++                        delta_x: delta.x,
++                        delta_y: delta.y,
++                        preview_width: image_rect.width(),
++                        preview_height: image_rect.height(),
++                        source_width: source_size[0],
++                        source_height: source_size[1],
++                    }
++                };
++                send_preview_command(preview_ctx, command_tx, command);
++            }
++        }
++        if image_response.drag_stopped() {
++            if let Ok(mut state) = ui_state.lock() {
++                state.resize_drag_layer = None;
++            }
++        }
++
++        if snapshot.selected_layer == Some(image_layer_id) {
++            let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(130, 220, 140));
++            ui.painter()
++                .rect_stroke(overlay_rect, 2.0, stroke, egui::StrokeKind::Outside);
++            ui.painter().rect_filled(
++                handle_rect,
++                1.0,
++                egui::Color32::from_rgb(130, 220, 140),
++            );
++        }
++    }
++
++    if outer_response.clicked() && !overlay_interacted {
++        if let Some(pointer) = outer_response.interact_pointer_pos() {
++            if image_rect.contains(pointer) {
++                send_preview_command(
++                    preview_ctx,
++                    command_tx,
++                    PreviewViewportCommand::Select(None),
++                );
++            }
++        }
++    }
++
++    ui.small(format!(
++        "プレビュー別窓 / 入力 {}×{} / 画像・ししゃものドラッグ編集対応",
++        source_size[0], source_size[1]
++    ));
++}
++
++
+ pub struct YaoyorozuApp {
+     vm: StreamViewModel,
+     elapsed_ms: u64,
+@@ -449,8 +917,12 @@
+     capture: Option<CaptureWorker>,
+     capture_target_fps: u32,
+ 
+-    preview_texture: Option<egui::TextureHandle>,
+     preview_size: [u32; 2],
++    preview_snapshot: Arc<RwLock<PreviewRenderSnapshot>>,
++    streamed_preview_frame: Arc<RwLock<Option<stream_capture::CaptureFrame>>>,
++    preview_ui_state: Arc<Mutex<DeferredPreviewUiState>>,
++    preview_command_tx: mpsc::Sender<PreviewViewportCommand>,
++    preview_command_rx: mpsc::Receiver<PreviewViewportCommand>,
+     preview_window_open: bool,
+     preview_window_position: Option<[f32; 2]>,
+     preview_window_size: Option<[f32; 2]>,
+@@ -747,6 +1219,21 @@
+             bgm_library_dir.display()
+         );
+ 
++        let overlay_source = OverlaySource::default();
++        let image_overlays = Vec::new();
++        let app_started_at = Instant::now();
++        let preview_snapshot = Arc::new(RwLock::new(PreviewRenderSnapshot {
++            layers: layers.clone(),
++            overlay_source: overlay_source.clone(),
++            image_overlays: image_overlays.clone(),
++            selected_layer: None,
++            fish_layer_id,
++            app_started_at,
++        }));
++        let streamed_preview_frame = Arc::new(RwLock::new(None));
++        let preview_ui_state = Arc::new(Mutex::new(DeferredPreviewUiState::default()));
++        let (preview_command_tx, preview_command_rx) = mpsc::channel();
++
+         Self {
+             vm,
+             elapsed_ms: 0,
+@@ -755,8 +1242,12 @@
+             selected_source,
+             capture,
+             capture_target_fps,
+-            preview_texture: None,
+             preview_size: [0, 0],
++            preview_snapshot,
++            streamed_preview_frame,
++            preview_ui_state,
++            preview_command_tx,
++            preview_command_rx,
+             preview_window_open: persisted_settings.preview_window_open,
+             preview_window_position: sanitize_window_position(
+                 persisted_settings.preview_window_position,
+@@ -782,13 +1273,13 @@
+             capture_preview_mode: PreviewMode::Fps30,
+             streaming_target,
+             show_stream_key: false,
+-            overlay_source: OverlaySource::default(),
++            overlay_source,
+             layers,
+             selected_layer: None,
+             next_layer_id: fish_layer_id + 1,
+             fish_layer_id,
+             preview_resize_drag: false,
+-            image_overlays: Vec::new(),
++            image_overlays,
+             image_overlay_message: "画像オーバーレイ: 未追加".to_owned(),
+             image_library_dir,
+             image_library_files,
+@@ -799,7 +1290,7 @@
+             bgm_library_files,
+             bgm_library_message,
+             bgm_message: "BGM: 未追加".to_owned(),
+-            app_started_at: std::time::Instant::now(),
++            app_started_at,
+             streaming: None,
+             streaming_message: "配信: 待機中".to_owned(),
+             performance: PerformanceMonitor::new(),
+@@ -942,8 +1433,14 @@
+         // Drop previous worker first. Worker owns its capture thread and joins
+         // during Drop, keeping capture lifetime localized.
+         self.capture = None;
+-        self.preview_texture = None;
+         self.preview_size = [0, 0];
++        if let Ok(mut state) = self.preview_ui_state.lock() {
++            state.texture = None;
++            state.resize_drag_layer = None;
++        }
++        if let Ok(mut frame) = self.streamed_preview_frame.write() {
++            *frame = None;
++        }
+ 
+         match CaptureWorker::start(source.clone(), self.capture_target_fps) {
+             Ok(worker) => {
+@@ -1003,103 +1500,142 @@
+         }
+     }
+ 
+-    fn update_preview_texture(&mut self, ctx: &egui::Context) {
+-        let Some(capture) = &self.capture else {
+-            return;
+-        };
++    fn make_preview_snapshot(&self) -> PreviewRenderSnapshot {
++        PreviewRenderSnapshot {
++            layers: self.layers.clone(),
++            overlay_source: self.overlay_source.clone(),
++            image_overlays: self.image_overlays.clone(),
++            selected_layer: self.selected_layer,
++            fish_layer_id: self.fish_layer_id,
++            app_started_at: self.app_started_at.clone(),
++        }
++    }
+ 
+-        let mut newest = None;
+-        while let Ok(frame) = capture.try_recv() {
+-            newest = Some(frame);
++    fn sync_preview_snapshot(&self) {
++        if let Ok(mut snapshot) = self.preview_snapshot.write() {
++            *snapshot = self.make_preview_snapshot();
+         }
++    }
+ 
+-        let Some(frame) = newest else {
++    fn sync_preview_dimensions_from_latest(&mut self) {
++        let Some(capture) = &self.capture else {
+             return;
+         };
+-
+-        self.preview_size = [frame.width, frame.height];
+-
+-        let needs_stream_frame = self.streaming.is_some();
+-        let needs_ui_texture = self.preview_window_open;
+-        if !needs_stream_frame && !needs_ui_texture {
+-            // Hidden preview + no live stream: dimensions are all we need.
+-            // Avoid RGBA clones, CPU overlay composition and egui texture uploads.
+-            return;
++        if let Some(frame) = capture.latest_preview_frame() {
++            self.preview_size = [frame.width, frame.height];
+         }
++    }
+ 
+-        let overlay_enabled = self.layers.iter().any(|layer| match layer.kind {
+-            LayerKind::FishOverlay if layer.id == self.fish_layer_id => self.overlay_source.enabled,
+-            LayerKind::Image => self
+-                .image_overlays
+-                .iter()
+-                .find(|(id, _)| *id == layer.id)
+-                .is_some_and(|(_, overlay)| overlay.enabled),
+-            _ => false,
+-        });
+-
+-        // Keep the original Arc-backed capture frame whenever no overlay is
+-        // active. This removes one full 960x540 RGBA allocation/copy per frame.
+-        //
+-        // `self.layers` is stored back-to-front. Composing in vector order
+-        // therefore makes the last item the visible front layer, matching the
+-        // layer list UI (which displays the vector in reverse).
+-        let composed_frame = if overlay_enabled {
+-            let mut composed_rgba = frame.rgba.to_vec();
+-            for layer in &self.layers {
+-                match layer.kind {
+-                    LayerKind::FishOverlay if layer.id == self.fish_layer_id => {
+-                        self.overlay_source.compose_test_overlay(
+-                            &mut composed_rgba,
+-                            frame.width,
+-                            frame.height,
+-                            self.app_started_at.elapsed().as_secs_f32(),
++    fn drain_preview_commands(&mut self) {
++        while let Ok(command) = self.preview_command_rx.try_recv() {
++            match command {
++                PreviewViewportCommand::Close => {
++                    self.preview_window_open = false;
++                }
++                PreviewViewportCommand::Geometry { position, size } => {
++                    self.preview_window_position = sanitize_window_position(position);
++                    self.preview_window_size = sanitize_window_size(size);
++                }
++                PreviewViewportCommand::Select(layer_id) => {
++                    self.selected_layer = layer_id;
++                    self.preview_resize_drag = false;
++                }
++                PreviewViewportCommand::Move {
++                    layer_id,
++                    delta_x,
++                    delta_y,
++                    preview_width,
++                    preview_height,
++                    source_width,
++                    source_height,
++                } => {
++                    if self.layer_locked(layer_id) {
++                        continue;
++                    }
++                    self.selected_layer = Some(layer_id);
++                    if layer_id == self.fish_layer_id {
++                        self.overlay_source.move_by_preview_delta(
++                            delta_x,
++                            delta_y,
++                            preview_width,
++                            preview_height,
++                            source_width,
++                            source_height,
++                        );
++                    } else if let Some((_, overlay)) = self
++                        .image_overlays
++                        .iter_mut()
++                        .find(|(id, _)| *id == layer_id)
++                    {
++                        overlay.move_by_preview_delta(
++                            delta_x,
++                            delta_y,
++                            preview_width,
++                            preview_height,
++                            source_width,
++                            source_height,
+                         );
+                     }
+-                    LayerKind::Image => {
+-                        if let Some((_, image_overlay)) = self
+-                            .image_overlays
+-                            .iter()
+-                            .find(|(id, _)| *id == layer.id)
+-                        {
+-                            image_overlay.compose(&mut composed_rgba, frame.width, frame.height);
+-                        }
++                }
++                PreviewViewportCommand::Resize {
++                    layer_id,
++                    delta_x,
++                    preview_width,
++                    source_width,
++                    source_height,
++                } => {
++                    if self.layer_locked(layer_id) {
++                        continue;
++                    }
++                    self.selected_layer = Some(layer_id);
++                    if layer_id == self.fish_layer_id {
++                        self.overlay_source.resize_by_preview_delta(
++                            delta_x,
++                            preview_width,
++                            source_width,
++                            source_height,
++                        );
++                    } else if let Some((_, overlay)) = self
++                        .image_overlays
++                        .iter_mut()
++                        .find(|(id, _)| *id == layer_id)
++                    {
++                        overlay.resize_by_preview_delta(
++                            delta_x,
++                            preview_width,
++                            source_width,
++                            source_height,
++                        );
+                     }
+-                    _ => {}
+                 }
+             }
+-            stream_capture::CaptureFrame {
+-                sequence: frame.sequence,
+-                width: frame.width,
+-                height: frame.height,
+-                rgba: std::sync::Arc::<[u8]>::from(composed_rgba),
+-            }
+-        } else {
+-            frame
+-        };
+-
+-        if let Some(streaming) = &self.streaming {
+-            streaming.push_video_frame(&composed_frame);
+         }
++    }
+ 
+-        if !needs_ui_texture {
+-            // Streaming can keep using the composited frame while the preview
+-            // window is closed, without paying for ColorImage/texture upload.
++    fn push_streaming_frame_if_available(&mut self) {
++        if self.streaming.is_none() {
+             return;
+         }
+ 
+-        let image = egui::ColorImage::from_rgba_unmultiplied(
+-            [
+-                composed_frame.width as usize,
+-                composed_frame.height as usize,
+-            ],
+-            &composed_frame.rgba,
+-        );
++        let Some(capture) = &self.capture else {
++            return;
++        };
++        let mut newest = None;
++        while let Ok(frame) = capture.try_recv() {
++            newest = Some(frame);
++        }
++        let Some(frame) = newest else {
++            return;
++        };
+ 
+-        if let Some(texture) = &mut self.preview_texture {
+-            texture.set(image, egui::TextureOptions::LINEAR);
+-        } else {
+-            self.preview_texture =
+-                Some(ctx.load_texture("capture-preview", image, egui::TextureOptions::LINEAR));
++        self.preview_size = [frame.width, frame.height];
++        let snapshot = self.make_preview_snapshot();
++        let composed_frame = compose_preview_frame(frame, &snapshot);
++        if let Ok(mut preview_frame) = self.streamed_preview_frame.write() {
++            *preview_frame = Some(composed_frame.clone());
++        }
++        if let Some(streaming) = &self.streaming {
++            streaming.push_video_frame(&composed_frame);
+         }
+     }
+ 
+@@ -1428,253 +1964,6 @@
+             });
+     }
+ 
+-    fn draw_preview_canvas(
+-        &mut self,
+-        ui: &mut egui::Ui,
+-        outer_size: egui::Vec2,
+-        compact_info: bool,
+-    ) {
+-        let desired = egui::vec2(outer_size.x.max(120.0), outer_size.y.max(120.0));
+-        let (outer, outer_response) = ui.allocate_exact_size(desired, egui::Sense::click());
+-        ui.painter()
+-            .rect_filled(outer, 4.0, egui::Color32::from_rgb(18, 20, 24));
+-
+-        let mut overlay_interacted = false;
+-        if let Some(texture) = &self.preview_texture {
+-            let (draw_w, draw_h) = fit_aspect(
+-                self.preview_size[0] as f32,
+-                self.preview_size[1] as f32,
+-                outer.width(),
+-                outer.height(),
+-            );
+-            let image_rect =
+-                egui::Rect::from_center_size(outer.center(), egui::vec2(draw_w, draw_h));
+-            ui.painter().image(
+-                texture.id(),
+-                image_rect,
+-                egui::Rect::from_min_max(egui::Pos2::new(0.0, 0.0), egui::Pos2::new(1.0, 1.0)),
+-                egui::Color32::WHITE,
+-            );
+-
+-            if self.overlay_source.enabled && self.preview_size[0] > 0 && self.preview_size[1] > 0 {
+-                let fish_locked = self.layer_locked(self.fish_layer_id);
+-                let fish_w = image_rect.width() * self.overlay_source.width_percent / 100.0;
+-                let fish_h = fish_w * 0.42;
+-                let bounce = if self.overlay_source.bounce {
+-                    (self.app_started_at.elapsed().as_secs_f32() * 4.2)
+-                        .sin()
+-                        .abs()
+-                        * image_rect.height()
+-                        * 0.055
+-                } else {
+-                    0.0
+-                };
+-                let center = egui::pos2(
+-                    image_rect.left() + image_rect.width() * self.overlay_source.x_percent / 100.0,
+-                    image_rect.top() + image_rect.height() * self.overlay_source.y_percent / 100.0
+-                        - bounce,
+-                );
+-                let fish_rect = egui::Rect::from_center_size(center, egui::vec2(fish_w, fish_h));
+-                let hit_rect = fish_rect.expand(5.0).intersect(image_rect);
+-                let fish_response = ui.interact(
+-                    hit_rect,
+-                    ui.id().with("overlay_fish_drag"),
+-                    egui::Sense::click_and_drag(),
+-                );
+-
+-                let handle_size = 12.0;
+-                let handle_rect = egui::Rect::from_center_size(
+-                    fish_rect.right_bottom(),
+-                    egui::vec2(handle_size, handle_size),
+-                );
+-
+-                if fish_response.clicked() {
+-                    self.selected_layer = Some(self.fish_layer_id);
+-                    overlay_interacted = true;
+-                }
+-                if fish_response.drag_started() {
+-                    self.selected_layer = Some(self.fish_layer_id);
+-                    overlay_interacted = true;
+-                    self.preview_resize_drag = !fish_locked
+-                        && ui
+-                            .ctx()
+-                            .pointer_interact_pos()
+-                            .map(|p| handle_rect.expand(5.0).contains(p))
+-                            .unwrap_or(false);
+-                }
+-                if fish_response.dragged() {
+-                    overlay_interacted = true;
+-                    // egui::Response::drag_delta() is cumulative from drag start.
+-                    // Applying that value every repaint makes transform editing unstable.
+-                    // Use the pointer's per-frame delta while this layer owns the drag.
+-                    let delta = ui.ctx().input(|i| i.pointer.delta());
+-                    if fish_locked {
+-                        // Locked layers can still be selected, but transforms are ignored.
+-                    } else if self.preview_resize_drag {
+-                        self.overlay_source.resize_by_preview_delta(
+-                            delta.x,
+-                            image_rect.width(),
+-                            self.preview_size[0],
+-                            self.preview_size[1],
+-                        );
+-                    } else {
+-                        self.overlay_source.move_by_preview_delta(
+-                            delta.x,
+-                            delta.y,
+-                            image_rect.width(),
+-                            image_rect.height(),
+-                            self.preview_size[0],
+-                            self.preview_size[1],
+-                        );
+-                    }
+-                }
+-                if fish_response.drag_stopped() {
+-                    self.preview_resize_drag = false;
+-                }
+-
+-                if self.selected_layer == Some(self.fish_layer_id) {
+-                    let stroke = egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(100, 190, 255));
+-                    ui.painter()
+-                        .rect_stroke(fish_rect, 2.0, stroke, egui::StrokeKind::Outside);
+-                    ui.painter().rect_filled(
+-                        handle_rect,
+-                        1.0,
+-                        egui::Color32::from_rgb(100, 190, 255),
+-                    );
+-                }
+-            }
+-
+-            let image_layer_ids: Vec<LayerId> = self
+-                .layers
+-                .iter()
+-                .rev()
+-                .filter(|layer| layer.kind == LayerKind::Image)
+-                .map(|layer| layer.id)
+-                .collect();
+-
+-            for image_layer_id in image_layer_ids {
+-                let image_locked = self.layer_locked(image_layer_id);
+-                let Some(image_index) = self
+-                    .image_overlays
+-                    .iter()
+-                    .position(|(id, _)| *id == image_layer_id)
+-                else {
+-                    continue;
+-                };
+-                let image_overlay = &mut self.image_overlays[image_index].1;
+-                if !image_overlay.enabled || self.preview_size[0] == 0 || self.preview_size[1] == 0 {
+-                    continue;
+-                }
+-
+-                let overlay_w = image_rect.width() * image_overlay.width_percent / 100.0;
+-                let overlay_h = overlay_w * image_overlay.aspect();
+-                let center = egui::pos2(
+-                    image_rect.left() + image_rect.width() * image_overlay.x_percent / 100.0,
+-                    image_rect.top() + image_rect.height() * image_overlay.y_percent / 100.0,
+-                );
+-                let overlay_rect =
+-                    egui::Rect::from_center_size(center, egui::vec2(overlay_w, overlay_h));
+-                let hit_rect = overlay_rect.expand(5.0).intersect(image_rect);
+-                let image_response = ui.interact(
+-                    hit_rect,
+-                    ui.id().with(("overlay_image_drag", image_layer_id)),
+-                    egui::Sense::click_and_drag(),
+-                );
+-                let handle_size = 12.0;
+-                let handle_rect = egui::Rect::from_center_size(
+-                    overlay_rect.right_bottom(),
+-                    egui::vec2(handle_size, handle_size),
+-                );
+-
+-                if image_response.clicked() {
+-                    self.selected_layer = Some(image_layer_id);
+-                    overlay_interacted = true;
+-                }
+-                if image_response.drag_started() {
+-                    self.selected_layer = Some(image_layer_id);
+-                    overlay_interacted = true;
+-                    self.preview_resize_drag = !image_locked
+-                        && ui
+-                            .ctx()
+-                            .pointer_interact_pos()
+-                            .map(|p| handle_rect.expand(5.0).contains(p))
+-                            .unwrap_or(false);
+-                }
+-                if image_response.dragged() {
+-                    overlay_interacted = true;
+-                    let delta = ui.ctx().input(|i| i.pointer.delta());
+-                    if image_locked {
+-                        // Locked layers can still be selected, but transforms are ignored.
+-                    } else if self.preview_resize_drag {
+-                        image_overlay.resize_by_preview_delta(
+-                            delta.x,
+-                            image_rect.width(),
+-                            self.preview_size[0],
+-                            self.preview_size[1],
+-                        );
+-                    } else {
+-                        image_overlay.move_by_preview_delta(
+-                            delta.x,
+-                            delta.y,
+-                            image_rect.width(),
+-                            image_rect.height(),
+-                            self.preview_size[0],
+-                            self.preview_size[1],
+-                        );
+-                    }
+-                }
+-                if image_response.drag_stopped() {
+-                    self.preview_resize_drag = false;
+-                }
+-
+-                if self.selected_layer == Some(image_layer_id) {
+-                    let stroke =
+-                        egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(130, 220, 140));
+-                    ui.painter().rect_stroke(
+-                        overlay_rect,
+-                        2.0,
+-                        stroke,
+-                        egui::StrokeKind::Outside,
+-                    );
+-                    ui.painter().rect_filled(
+-                        handle_rect,
+-                        1.0,
+-                        egui::Color32::from_rgb(130, 220, 140),
+-                    );
+-                }
+-            }
+-
+-            if outer_response.clicked() && !overlay_interacted {
+-                if let Some(pointer) = outer_response.interact_pointer_pos() {
+-                    if image_rect.contains(pointer) {
+-                        self.selected_layer = None;
+-                        self.preview_resize_drag = false;
+-                    }
+-                }
+-            }
+-        } else {
+-            ui.painter().text(
+-                outer.center(),
+-                egui::Align2::CENTER_CENTER,
+-                "キャプチャ待機中…",
+-                egui::FontId::proportional(16.0),
+-                egui::Color32::LIGHT_GRAY,
+-            );
+-        }
+-
+-        if compact_info {
+-            ui.small(format!(
+-                "入力 {}×{} / プレビュー窓でドラッグ編集",
+-                self.preview_size[0], self.preview_size[1]
+-            ));
+-        } else {
+-            ui.small(format!(
+-                "プレビュー別窓 / 入力 {}×{} / 画像・ししゃものドラッグ編集対応",
+-                self.preview_size[0], self.preview_size[1]
+-            ));
+-        }
+-    }
+-
+     fn draw_audio_mixer(&mut self, ui: &mut egui::Ui) {
+         let levels = self
+             .audio
+@@ -2173,44 +2462,90 @@
+             builder = builder.with_position([x, y]);
+         }
+ 
+-        let mut close_requested = false;
+-        ctx.show_viewport_immediate(viewport_id, builder, |preview_ctx, _class| {
++        let latest_frame: Option<LatestFrameSnapshot> =
++            self.capture.as_ref().map(|capture| capture.latest_preview_handle());
++        let streamed_frame = self
++            .streaming
++            .as_ref()
++            .map(|_| Arc::clone(&self.streamed_preview_frame));
++        let snapshot = Arc::clone(&self.preview_snapshot);
++        let ui_state = Arc::clone(&self.preview_ui_state);
++        let command_tx = self.preview_command_tx.clone();
++
++        ctx.show_viewport_deferred(viewport_id, builder, move |preview_ctx, _class| {
+             let viewport_info = preview_ctx.input(|input| input.viewport().clone());
+             if viewport_info.close_requested() {
+-                close_requested = true;
++                send_preview_command(preview_ctx, &command_tx, PreviewViewportCommand::Close);
++                return;
+             }
+ 
+-            if let Some(outer_rect) = viewport_info.outer_rect {
+-                self.preview_window_position = sanitize_window_position(Some([
+-                    outer_rect.min.x,
+-                    outer_rect.min.y,
+-                ]));
++            let position = viewport_info
++                .outer_rect
++                .map(|rect| [rect.min.x, rect.min.y]);
++            let size = viewport_info
++                .inner_rect
++                .map(|rect| [rect.width(), rect.height()]);
++
++            let mut geometry_command = None;
++            if let Ok(mut state) = ui_state.lock() {
++                // Some platforms briefly report one of these rectangles as None while
++                // a native viewport is being created. Keep the last known value so we
++                // never erase a valid sub-monitor restore position with a transient None.
++                let observed_position = position.or(state.last_window_position);
++                let observed_size = size.or(state.last_window_size);
++                let changed = geometry_changed(state.last_window_position, observed_position)
++                    || geometry_changed(state.last_window_size, observed_size);
++                if changed {
++                    state.last_window_position = observed_position;
++                    state.last_window_size = observed_size;
++                    geometry_command = Some(PreviewViewportCommand::Geometry {
++                        position: observed_position,
++                        size: observed_size,
++                    });
++                }
+             }
+-            if let Some(inner_rect) = viewport_info.inner_rect {
+-                self.preview_window_size = sanitize_window_size(Some([
+-                    inner_rect.width(),
+-                    inner_rect.height(),
+-                ]));
++            if let Some(command) = geometry_command {
++                send_preview_command(preview_ctx, &command_tx, command);
+             }
+ 
++            let snapshot_value = match snapshot.read() {
++                Ok(snapshot) => snapshot.clone(),
++                Err(_) => {
++                    preview_ctx.request_repaint_after(Duration::from_millis(33));
++                    return;
++                }
++            };
++
+             egui::CentralPanel::default().show(preview_ctx, |ui| {
+                 ui.horizontal(|ui| {
+                     ui.heading("プレビュー");
+                     ui.separator();
+                     ui.small("閉じても配信・録画は続行");
+                     if ui.button("閉じる").clicked() {
+-                        close_requested = true;
++                        send_preview_command(
++                            preview_ctx,
++                            &command_tx,
++                            PreviewViewportCommand::Close,
++                        );
+                     }
+                 });
+                 ui.separator();
+                 let available = ui.available_size();
+-                self.draw_preview_canvas(ui, available, false);
++                draw_deferred_preview_canvas(
++                    preview_ctx,
++                    ui,
++                    available,
++                    &snapshot_value,
++                    latest_frame.as_ref(),
++                    streamed_frame.as_ref(),
++                    &ui_state,
++                    &command_tx,
++                );
+             });
+-        });
+ 
+-        if close_requested {
+-            self.preview_window_open = false;
+-        }
++            // Deferred viewport repaints independently from the main control UI.
++            preview_ctx.request_repaint_after(Duration::from_millis(33));
++        });
+     }
+ 
+     fn show_settings_window(&mut self, ctx: &egui::Context) {
+@@ -2366,12 +2701,15 @@
+ 
+ impl eframe::App for YaoyorozuApp {
+     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
++        self.drain_preview_commands();
+         self.bgm_players.retain(|_, player| !player.is_finished());
+         self.poll_recording_finalize();
+         self.poll_streaming();
+         self.performance.refresh_if_due();
+         self.sync_capture_preview_mode();
+-        self.update_preview_texture(ctx);
++        self.sync_preview_dimensions_from_latest();
++        self.push_streaming_frame_if_available();
++        self.sync_preview_snapshot();
+         self.show_preview_viewport(ctx);
+         self.show_mixer_viewport(ctx);
+         self.show_settings_window(ctx);
+@@ -3028,30 +3366,24 @@
+             self.elapsed_ms = self.elapsed_ms.saturating_add(16);
+         }
+ 
+-        let repaint_ms = if self.streaming.is_some() {
+-            // Live input readback currently runs at 30 FPS, so repainting the
+-            // egui control surface at 60 FPS only burns CPU without adding frames.
+-            33
+-        } else if self.preview_window_open {
+-            // Preview editing remains smooth enough at 30 FPS.
+-            33
+-        } else if self.recording.is_some() {
+-            match self.recording_preview_mode {
+-                PreviewMode::Fps30 => 33,
+-                PreviewMode::Fps15 => 66,
+-                PreviewMode::Off => 250,
+-            }
+-        } else {
+-            // Idle + hidden preview: meters/status do not need game-frame cadence.
+-            100
+-        };
+-        ctx.request_repaint_after(std::time::Duration::from_millis(repaint_ms));
++        // Main controls and deferred preview no longer share the same repaint clock.
++        // Sync any controls changed during this pass, then let the preview viewport
++        // continue at its own 30 FPS cadence.
++        self.sync_preview_snapshot();
++        let repaint_ms = main_ui_repaint_ms(
++            self.streaming.is_some(),
++            self.preview_window_open,
++            self.recording.is_some(),
++            self.recording_preview_mode,
++        );
++        ctx.request_repaint_after(Duration::from_millis(repaint_ms));
+     }
+ }
+ 
+ #[cfg(test)]
+ mod toolbar_tests {
+-    use super::toggle_window_open;
++    use super::{main_ui_repaint_ms, toggle_window_open};
++    use stream_capture::PreviewMode;
+ 
+     #[test]
+     fn toolbar_toggle_flips_auxiliary_window_state_both_ways() {
+@@ -3061,4 +3393,16 @@
+         toggle_window_open(&mut open);
+         assert!(!open);
+     }
++    #[test]
++    fn deferred_preview_does_not_force_main_ui_to_30fps() {
++        assert_eq!(
++            main_ui_repaint_ms(false, false, false, PreviewMode::Fps15),
++            100
++        );
++        assert_eq!(
++            main_ui_repaint_ms(false, true, false, PreviewMode::Fps15),
++            100
++        );
++    }
++
+ }
+--- a/apps/tsubame/src/scene.rs
++++ b/apps/tsubame/src/scene.rs
+@@ -1,5 +1,7 @@
+-use std::path::{Path, PathBuf};
+-
++use std::{
++    path::{Path, PathBuf},
++    sync::Arc,
++};
+ 
+ pub type LayerId = u64;
+ 
+@@ -215,7 +217,7 @@
+     pub width_percent: f32,
+     pub pixel_width: u32,
+     pub pixel_height: u32,
+-    rgba: Vec<u8>,
++    rgba: Arc<[u8]>,
+ }
+ 
+ impl ImageOverlaySource {
+@@ -255,7 +257,7 @@
+             width_percent: 24.0,
+             pixel_width,
+             pixel_height,
+-            rgba,
++            rgba: Arc::<[u8]>::from(rgba),
+         })
+     }
+ 
+@@ -487,7 +489,7 @@
+             width_percent: 50.0,
+             pixel_width: 1,
+             pixel_height: 1,
+-            rgba: vec![255, 0, 0, 255],
++            rgba: Arc::<[u8]>::from(vec![255, 0, 0, 255]),
+         };
+         let mut target = vec![0u8; 4 * 4 * 4];
+         source.compose(&mut target, 4, 4);
+@@ -507,7 +509,7 @@
+             width_percent: 20.0,
+             pixel_width: 100,
+             pixel_height: 50,
+-            rgba: vec![255; 100 * 50 * 4],
++            rgba: Arc::<[u8]>::from(vec![255; 100 * 50 * 4]),
+         };
+         source.clamp_to_frame(1920, 1080);
+         assert!(source.x_percent >= 10.0);
+--- a/crates/stream-capture/src/lib.rs
++++ b/crates/stream-capture/src/lib.rs
+@@ -156,21 +156,45 @@
+     out
+ }
+ 
++#[derive(Clone, Default)]
++pub struct LatestFrameSnapshot {
++    latest: Arc<Mutex<Option<CaptureFrame>>>,
++}
++
++impl LatestFrameSnapshot {
++    fn store(&self, frame: CaptureFrame) {
++        if let Ok(mut latest) = self.latest.lock() {
++            *latest = Some(frame);
++        }
++    }
++
++    pub fn latest_frame(&self) -> Option<CaptureFrame> {
++        self.latest.lock().ok().and_then(|latest| latest.clone())
++    }
++}
++
+ #[derive(Clone)]
+ pub struct FrameQueue {
+     tx: Sender<CaptureFrame>,
+     rx: Receiver<CaptureFrame>,
++    latest: LatestFrameSnapshot,
+ }
+ 
+ impl FrameQueue {
+     pub fn new(capacity: usize) -> Self {
+         let (tx, rx) = bounded(capacity.max(1));
+-        Self { tx, rx }
++        Self {
++            tx,
++            rx,
++            latest: LatestFrameSnapshot::default(),
++        }
+     }
+ 
+     /// Non-blocking newest-frame queue.
+     /// No pixel-buffer clone occurs: CaptureFrame uses Arc<[u8]>.
+     pub fn push_latest(&self, frame: CaptureFrame) {
++        self.latest.store(frame.clone());
++
+         match self.tx.try_send(frame) {
+             Ok(()) => {}
+             Err(crossbeam_channel::TrySendError::Full(frame)) => {
+@@ -188,6 +212,16 @@
+     pub fn receiver(&self) -> Receiver<CaptureFrame> {
+         self.rx.clone()
+     }
++
++    /// Return the newest preview frame without consuming the delivery queue.
++    pub fn latest_frame(&self) -> Option<CaptureFrame> {
++        self.latest.latest_frame()
++    }
++
++    /// Cheap cloneable handle for deferred preview windows.
++    pub fn latest_handle(&self) -> LatestFrameSnapshot {
++        self.latest.clone()
++    }
+ }
+ 
+ 
+@@ -333,6 +367,13 @@
+         self.preview_queue.try_recv()
+     }
+ 
++    pub fn latest_preview_frame(&self) -> Option<CaptureFrame> {
++        self.preview_queue.latest_frame()
++    }
++
++    pub fn latest_preview_handle(&self) -> LatestFrameSnapshot {
++        self.preview_queue.latest_handle()
++    }
+ 
+     pub fn backend(&self) -> CaptureBackend {
+         CaptureBackend::WindowsGraphicsCapture
+--- a/crates/stream-capture/tests/latest_preview.rs
++++ b/crates/stream-capture/tests/latest_preview.rs
+@@ -0,0 +1,16 @@
++use stream_capture::{CaptureFrame, FrameQueue};
++
++#[test]
++fn latest_preview_snapshot_does_not_consume_delivery_queue() {
++    let queue = FrameQueue::new(2);
++    queue.push_latest(CaptureFrame::test(1, 320, 180));
++    queue.push_latest(CaptureFrame::test(2, 320, 180));
++
++    let latest = queue.latest_frame().expect("latest frame");
++    assert_eq!(latest.sequence, 2);
++
++    // Reading the snapshot must not steal the frame used by the existing
++    // consumer path (streaming / main-thread polling).
++    let delivered = queue.try_recv().expect("queued frame remains available");
++    assert!(matches!(delivered.sequence, 1 | 2));
++}

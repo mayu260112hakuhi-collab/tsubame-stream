@@ -1,0 +1,514 @@
+--- a/apps/tsubame/src/app.rs
++++ b/apps/tsubame/src/app.rs
+@@ -1271,8 +1271,7 @@
+                                     gain_percent: *volume_percent,
+                                     mute: Some(*muted),
+                                     mix: bgm_channel.map(|channel| channel.include_in_stream_mix),
+-                                    // 個別WAVはAudio.2で録画経路へ接続する。
+-                                    wav: None,
++                                    wav: bgm_channel.map(|channel| channel.record_individual),
+                                     removable: true,
+                                 },
+                             );
+@@ -1290,6 +1289,11 @@
+                                         audio.set_channel_include_in_stream_mix(channel.id, in_mix);
+                                     }
+                                 }
++                                if bgm_strip.wav != Some(channel.record_individual) {
++                                    if let Some(record) = bgm_strip.wav {
++                                        audio.set_channel_record_individual(channel.id, record);
++                                    }
++                                }
+                             }
+                             if bgm_strip.remove_clicked {
+                                 bgm_mixer_remove = Some(*bgm_id);
+@@ -2458,19 +2462,25 @@
+             .map(|audio| audio.device_state())
+             .unwrap_or_default();
+ 
+-        let channel_mixer = self
++        let (channel_mixer, external_pcm_sources) = self
+             .audio
+             .as_ref()
+-            .map(|audio| audio.channel_mixer())
+-            .unwrap_or_default();
++            .map(|audio| {
++                (
++                    audio.channel_mixer(),
++                    audio.external_pcm_recording_sources(),
++                )
++            })
++            .unwrap_or_else(|| (ChannelMixerControl::default(), Vec::new()));
+ 
+-        match RecordingSession::start_with_audio_routing(
++        match RecordingSession::start_with_audio_routing_and_external(
+             "recordings",
+             config,
+             gpu,
+             mixer,
+             channel_mixer,
+             audio_devices,
++            external_pcm_sources,
+         ) {
+             Ok(session) => {
+                 self.recording_message = format!(
+--- a/crates/stream-audio/src/lib.rs
++++ b/crates/stream-audio/src/lib.rs
+@@ -335,6 +335,21 @@
+     }
+ }
+ 
++pub struct ExternalPcmRecordingSource {
++    channel_id: AudioChannelId,
++    receiver: Receiver<Arc<[u8]>>,
++}
++
++impl ExternalPcmRecordingSource {
++    pub fn channel_id(&self) -> AudioChannelId {
++        self.channel_id
++    }
++
++    pub fn into_receiver(self) -> Receiver<Arc<[u8]>> {
++        self.receiver
++    }
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq)]
+ pub struct MixerSettings {
+     pub mic_gain: f32,
+@@ -739,6 +754,21 @@
+         })
+     }
+ 
++    pub fn external_pcm_recording_sources(&self) -> Vec<ExternalPcmRecordingSource> {
++        self.external_pcm_buses
++            .lock()
++            .map(|buses| {
++                buses
++                    .iter()
++                    .map(|(&channel_id, bus)| ExternalPcmRecordingSource {
++                        channel_id,
++                        receiver: bus.subscribe(),
++                    })
++                    .collect()
++            })
++            .unwrap_or_default()
++    }
++
+     pub fn application_sources(&self) -> Vec<ApplicationAudioSource> {
+         self.application_sources
+             .lock()
+@@ -1579,11 +1609,17 @@
+     pub path: std::path::PathBuf,
+ }
+ 
+-#[derive(Debug, Clone)]
++pub struct ExternalPcmRecordingPath {
++    pub channel_id: AudioChannelId,
++    pub path: std::path::PathBuf,
++    pub source: ExternalPcmRecordingSource,
++}
++
+ pub struct AudioRecordingPaths {
+     pub microphone: std::path::PathBuf,
+     pub desktop: std::path::PathBuf,
+     pub applications: Vec<ApplicationRecordingPath>,
++    pub external: Vec<ExternalPcmRecordingPath>,
+ }
+ 
+ pub struct PcmRecordingWorker {
+@@ -1591,6 +1627,7 @@
+     mic_thread: Option<JoinHandle<Result<(), AudioError>>>,
+     desktop_thread: Option<JoinHandle<Result<(), AudioError>>>,
+     application_threads: Vec<(AudioChannelId, JoinHandle<Result<(), AudioError>>)>,
++    external_threads: Vec<(AudioChannelId, JoinHandle<Result<(), AudioError>>)>,
+ }
+ 
+ impl PcmRecordingWorker {
+@@ -1652,11 +1689,46 @@
+                 application_threads.push((channel_id, handle));
+             }
+ 
++            let mut external_threads: Vec<(AudioChannelId, JoinHandle<Result<(), AudioError>>)> =
++                Vec::new();
++            for external in paths.external {
++                let external_stop = Arc::clone(&stop);
++                let channel_id = external.channel_id;
++                let path = external.path;
++                let receiver = external.source.into_receiver();
++                let handle = match thread::Builder::new()
++                    .name(format!("yaoyorozu-external-recorder-{channel_id}"))
++                    .spawn(move || {
++                        windows_pcm::record_external_pcm(
++                            &path,
++                            external_stop,
++                            receiver,
++                            channel_id,
++                        )
++                    }) {
++                    Ok(handle) => handle,
++                    Err(err) => {
++                        stop.store(true, Ordering::Relaxed);
++                        let _ = mic_thread.join();
++                        let _ = desktop_thread.join();
++                        for (_, handle) in application_threads {
++                            let _ = handle.join();
++                        }
++                        for (_, handle) in external_threads {
++                            let _ = handle.join();
++                        }
++                        return Err(AudioError::Backend(err.to_string()));
++                    }
++                };
++                external_threads.push((channel_id, handle));
++            }
++
+             Ok(Self {
+                 stop,
+                 mic_thread: Some(mic_thread),
+                 desktop_thread: Some(desktop_thread),
+                 application_threads,
++                external_threads,
+             })
+         }
+ 
+@@ -1698,6 +1770,17 @@
+             let _ = handle.join();
+         }
+ 
++        for (_channel_id, handle) in self.external_threads.drain(..) {
++            match handle.join() {
++                Ok(result) => result?,
++                Err(_) => {
++                    return Err(AudioError::Backend(
++                        "外部PCM録音スレッドがpanicしました".to_owned(),
++                    ))
++                }
++            }
++        }
++
+         Ok(())
+     }
+ }
+@@ -2223,6 +2306,75 @@
+         result
+     }
+ 
++    pub fn record_external_pcm(
++        path: &Path,
++        stop: Arc<AtomicBool>,
++        receiver: Receiver<Arc<[u8]>>,
++        channel_id: AudioChannelId,
++    ) -> Result<(), AudioError> {
++        const PACKET_SAMPLES: usize = 1_920; // 20 ms @ 48 kHz stereo
++        let mut writer =
++            WavWriter::create(path, wav_spec()).map_err(|e| AudioError::Backend(e.to_string()))?;
++        let mut total_samples = 0_u64;
++        let mut max_peak = 0.0_f32;
++
++        while !stop.load(Ordering::Relaxed) {
++            let packet = match receiver.recv_timeout(std::time::Duration::from_millis(20)) {
++                Ok(packet) => Some(packet),
++                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => None,
++            };
++
++            if let Some(packet) = packet {
++                let bytes = packet.as_ref();
++                let usable = bytes.len() - (bytes.len() % 2);
++                for chunk in bytes[..usable].chunks_exact(2) {
++                    let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
++                    max_peak = max_peak.max(
++                        (sample as f32 / i16::MAX as f32)
++                            .abs()
++                            .clamp(0.0, 1.0),
++                    );
++                    writer
++                        .write_sample(sample)
++                        .map_err(|e| AudioError::Backend(e.to_string()))?;
++                    total_samples += 1;
++                }
++            } else {
++                for _ in 0..PACKET_SAMPLES {
++                    writer
++                        .write_sample(0_i16)
++                        .map_err(|e| AudioError::Backend(e.to_string()))?;
++                }
++                total_samples += PACKET_SAMPLES as u64;
++            }
++        }
++
++        writer
++            .finalize()
++            .map_err(|e| AudioError::Backend(e.to_string()))?;
++
++        let track_name = format!("external-{channel_id}");
++        let duration_seconds = total_samples as f64 / CHANNELS as f64 / SAMPLE_RATE as f64;
++        let peak_db = if max_peak <= 0.000_001 {
++            -120.0
++        } else {
++            20.0 * (max_peak as f64).log10()
++        };
++        let debug = format!(
++            "track={track_name}\n\
++             sample_rate={SAMPLE_RATE}\n\
++             channels={CHANNELS}\n\
++             format=pcm_s16le\n\
++             samples={total_samples}\n\
++             duration_seconds={duration_seconds:.3}\n\
++             peak={max_peak:.8}\n\
++             peak_dbfs={peak_db:.2}\n"
++        );
++        std::fs::write(path.with_extension("audio.txt"), debug)
++            .map_err(|e| AudioError::Backend(format!("{track_name}: debug write: {e}")))?;
++        Ok(())
++    }
++
+     pub fn record_application_loopback(
+         path: &Path,
+         stop: Arc<AtomicBool>,
+@@ -2519,6 +2671,28 @@
+     }
+ 
+     #[test]
++    fn external_pcm_recording_source_subscribes_to_same_raw_bus() {
++        let mixer = ChannelMixerControl::default();
++        let channel_id = mixer.add_channel(AudioChannel::custom("BGM"));
++        let bus = ExternalPcmBus::default();
++        let sender = ExternalPcmSender {
++            channel_id,
++            bus: bus.clone(),
++            mixer,
++        };
++        let source = ExternalPcmRecordingSource {
++            channel_id,
++            receiver: bus.subscribe(),
++        };
++        sender.push_f32_stereo_48k(&[0.5, -0.5]);
++        let packet = source
++            .into_receiver()
++            .recv_timeout(std::time::Duration::from_millis(100))
++            .expect("recording subscriber should receive raw PCM");
++        assert_eq!(packet.len(), 4);
++    }
++
++    #[test]
+     fn external_pcm_bus_broadcasts_pcm16_packet() {
+         let mixer = ChannelMixerControl::default();
+         let channel_id = mixer.add_channel(AudioChannel::custom("BGM"));
+--- a/crates/stream-recording/src/lib.rs
++++ b/crates/stream-recording/src/lib.rs
+@@ -8,7 +8,8 @@
+ };
+ use stream_audio::{
+     ApplicationRecordingPath, AudioChannel, AudioChannelId, AudioChannelKind, AudioDeviceState,
+-    AudioRecordingPaths, ChannelMixerControl, MixerControl, MixerSettings, PcmRecordingWorker,
++    AudioRecordingPaths, ChannelMixerControl, ExternalPcmRecordingPath, ExternalPcmRecordingSource,
++    MixerControl, MixerSettings, PcmRecordingWorker,
+ };
+ use stream_capture::{GpuRecordingConfig, GpuRecordingHandle, GpuRecordingStatus};
+ use stream_core::EditManifest;
+@@ -374,6 +375,12 @@
+         self.root
+             .join(format!("application_{channel_id}_{safe_name}.wav"))
+     }
++
++    pub fn external_audio(&self, channel_id: AudioChannelId, name: &str) -> PathBuf {
++        let safe_name = sanitize_track_name(name);
++        self.root
++            .join(format!("external_{channel_id}_{safe_name}.wav"))
++    }
+ }
+ 
+ fn sanitize_track_name(name: &str) -> String {
+@@ -407,6 +414,13 @@
+ }
+ 
+ #[derive(Debug, Clone)]
++struct ExternalTrack {
++    channel_id: AudioChannelId,
++    path: PathBuf,
++    start_channel: AudioChannel,
++}
++
++#[derive(Debug, Clone)]
+ pub struct FinalMixTrack {
+     pub path: PathBuf,
+     pub gain: f32,
+@@ -514,6 +528,7 @@
+     mixer: MixerControl,
+     channel_mixer: ChannelMixerControl,
+     application_tracks: Vec<ApplicationTrack>,
++    external_tracks: Vec<ExternalTrack>,
+ }
+ impl RecordingSession {
+     pub fn start(
+@@ -557,6 +572,26 @@
+         channel_mixer: ChannelMixerControl,
+         audio_devices: AudioDeviceState,
+     ) -> Result<Self, RecordingError> {
++        Self::start_with_audio_routing_and_external(
++            base_dir,
++            config,
++            gpu,
++            mixer,
++            channel_mixer,
++            audio_devices,
++            Vec::new(),
++        )
++    }
++
++    pub fn start_with_audio_routing_and_external(
++        base_dir: impl AsRef<Path>,
++        config: RecordingConfig,
++        gpu: GpuRecordingHandle,
++        mixer: MixerControl,
++        channel_mixer: ChannelMixerControl,
++        audio_devices: AudioDeviceState,
++        external_sources: Vec<ExternalPcmRecordingSource>,
++    ) -> Result<Self, RecordingError> {
+         if config.source_width == 0
+             || config.source_height == 0
+             || config.output_width == 0
+@@ -600,6 +635,26 @@
+             })
+             .collect();
+ 
++        let mut external_tracks = Vec::new();
++        let mut external_recording_paths = Vec::new();
++        for source in external_sources {
++            let channel_id = source.channel_id();
++            let Some(channel) = channel_mixer.channel(channel_id) else {
++                continue;
++            };
++            let path = paths.external_audio(channel_id, &channel.name);
++            external_tracks.push(ExternalTrack {
++                channel_id,
++                path: path.clone(),
++                start_channel: channel,
++            });
++            external_recording_paths.push(ExternalPcmRecordingPath {
++                channel_id,
++                path,
++                source,
++            });
++        }
++
+         let audio = match PcmRecordingWorker::start_with_devices(
+             AudioRecordingPaths {
+                 microphone: paths.microphone.clone(),
+@@ -612,6 +667,7 @@
+                         path: track.path.clone(),
+                     })
+                     .collect(),
++                external: external_recording_paths,
+             },
+             audio_devices,
+         ) {
+@@ -630,6 +686,7 @@
+             mixer,
+             channel_mixer,
+             application_tracks,
++            external_tracks,
+         })
+     }
+ 
+@@ -701,8 +758,14 @@
+             legacy_mixer,
+             &channels,
+             &self.application_tracks,
++            &self.external_tracks,
+         )?;
+-        cleanup_unwanted_individual_wavs(&self.paths, &channels, &self.application_tracks);
++        cleanup_unwanted_individual_wavs(
++            &self.paths,
++            &channels,
++            &self.application_tracks,
++            &self.external_tracks,
++        );
+         Ok(self.paths.clone())
+     }
+ }
+@@ -715,6 +778,17 @@
+         .unwrap_or_else(|| track.start_channel.clone())
+ }
+ 
++fn current_or_start_external_channel(
++    channels: &[AudioChannel],
++    track: &ExternalTrack,
++) -> AudioChannel {
++    channels
++        .iter()
++        .find(|channel| channel.id == track.channel_id)
++        .cloned()
++        .unwrap_or_else(|| track.start_channel.clone())
++}
++
+ fn remove_temporary_track_files(path: &Path) {
+     // Phase 9.2.4 Fix2: each temporary WAV also has a diagnostics sidecar
+     // (`*.audio.txt`).  `record_individual = false` means neither artifact
+@@ -727,6 +801,7 @@
+     paths: &RecordingPaths,
+     channels: &[AudioChannel],
+     application_tracks: &[ApplicationTrack],
++    external_tracks: &[ExternalTrack],
+ ) {
+     if let Some(channel) = channels
+         .iter()
+@@ -750,6 +825,12 @@
+             remove_temporary_track_files(&track.path);
+         }
+     }
++    for track in external_tracks {
++        let channel = current_or_start_external_channel(channels, track);
++        if !channel.record_individual {
++            remove_temporary_track_files(&track.path);
++        }
++    }
+ }
+ 
+ fn mux_final_mp4_routed(
+@@ -757,6 +838,7 @@
+     legacy_mixer: MixerSettings,
+     channels: &[AudioChannel],
+     application_tracks: &[ApplicationTrack],
++    external_tracks: &[ExternalTrack],
+ ) -> Result<(), RecordingError> {
+     let desktop = channels
+         .iter()
+@@ -821,6 +903,17 @@
+         });
+     }
+ 
++    for track in external_tracks {
++        let channel = current_or_start_external_channel(channels, track);
++        tracks.push(FinalMixTrack {
++            path: track.path.clone(),
++            gain: channel.gain,
++            muted: channel.muted,
++            enabled: channel.enabled,
++            include_in_stream_mix: channel.include_in_stream_mix,
++        });
++    }
++
+     let available_tracks: Vec<FinalMixTrack> = tracks
+         .into_iter()
+         .filter(|track| {
+@@ -880,3 +973,18 @@
+     }
+     Ok(())
+ }
++
++
++#[cfg(test)]
++mod phase8b_audio2_tests {
++    use super::*;
++
++    #[test]
++    fn external_audio_path_is_stable_and_distinct() {
++        let paths = RecordingPaths::for_root("recordings/test");
++        let path = paths.external_audio(101, "BGM: Theme Song");
++        let name = path.file_name().and_then(|v| v.to_str()).unwrap();
++        assert!(name.starts_with("external_101_"));
++        assert!(name.ends_with(".wav"));
++    }
++}

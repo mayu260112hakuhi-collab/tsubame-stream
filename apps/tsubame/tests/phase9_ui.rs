@@ -1,4 +1,4 @@
-use yaoyorozu_stream::ui_layout::{
+use tsubame_stream::ui_layout::{
     normal_preview_size, MIXER_CHANNELS, NORMAL_PREVIEW_WIDTH, SCENE_LABELS, SOURCE_LABELS,
     STREAM_TOOLBAR_LABELS,
 };
@@ -35,13 +35,13 @@ fn phase9_scene_and_source_shell_has_expected_entries() {
 
 #[test]
 fn source_selector_has_fixed_compact_width() {
-    use yaoyorozu_stream::ui_layout::SOURCE_SELECTOR_WIDTH;
+    use tsubame_stream::ui_layout::SOURCE_SELECTOR_WIDTH;
     assert_eq!(SOURCE_SELECTOR_WIDTH, 260.0);
 }
 
 #[test]
 fn long_source_name_is_compacted_for_combo_button() {
-    use yaoyorozu_stream::ui_layout::compact_source_name;
+    use tsubame_stream::ui_layout::compact_source_name;
 
     let title = "とても長いウィンドウタイトルですこれは配信ソフトの幅を押し広げてはいけません";
     let compact = compact_source_name(title, 18);
@@ -52,13 +52,13 @@ fn long_source_name_is_compacted_for_combo_button() {
 
 #[test]
 fn audio_meter_is_thin() {
-    use yaoyorozu_stream::ui_layout::AUDIO_METER_HEIGHT;
+    use tsubame_stream::ui_layout::AUDIO_METER_HEIGHT;
     assert_eq!(AUDIO_METER_HEIGHT, 8.0);
 }
 
 #[test]
 fn audio_meter_thresholds_are_ordered() {
-    use yaoyorozu_stream::ui_layout::{
+    use tsubame_stream::ui_layout::{
         METER_GREEN_END_DB, METER_ORANGE_END_DB, METER_YELLOW_END_DB,
     };
 

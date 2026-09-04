@@ -1,0 +1,73 @@
+--- a/apps/tsubame/src/app.rs
++++ b/apps/tsubame/src/app.rs
+@@ -1548,6 +1548,14 @@
+     }
+ }
+ 
++
++
++fn prefer_selected_or_active_bgm<T: Copy>(
++    selected_bgm: Option<T>,
++    active_bgm: Option<T>,
++) -> Option<T> {
++    selected_bgm.or(active_bgm)
++}
+ 
+ pub struct YaoyorozuApp {
+     vm: StreamViewModel,
+@@ -3579,6 +3587,13 @@
+                             .find(|layer| layer.id == selected_id && layer.kind == LayerKind::Audio)
+                             .map(|layer| layer.id)
+                     });
++                    let active_bgm_id = self
++                        .bgm_layers
++                        .iter()
++                        .find(|(id, _)| self.bgm_players.contains_key(id))
++                        .map(|(id, _)| *id);
++                    let bgm_control_layer_id =
++                        prefer_selected_or_active_bgm(selected_bgm_id, active_bgm_id);
+                     let mut bgm_play = false;
+                     let mut bgm_pause_resume = false;
+                     let mut bgm_stop = false;
+@@ -3586,7 +3601,7 @@
+                     let mut bgm_restart_for_loop = false;
+                     let mut bgm_volume_change: Option<f32> = None;
+                     let mut bgm_mute_change: Option<bool> = None;
+-                    if let Some(bgm_layer_id) = selected_bgm_id {
++                    if let Some(bgm_layer_id) = bgm_control_layer_id {
+                         if let Some(bgm_index) = self
+                             .bgm_layers
+                             .iter()
+@@ -3649,7 +3664,7 @@
+                                 });
+                         }
+                     }
+-                    if let Some(bgm_layer_id) = selected_bgm_id {
++                    if let Some(bgm_layer_id) = bgm_control_layer_id {
+                         if let Some(volume) = bgm_volume_change {
+                             if let Some(player) = self.bgm_players.get(&bgm_layer_id) {
+                                 player.set_volume(volume);
+@@ -3836,7 +3851,8 @@
+ mod toolbar_tests {
+     use super::{
+         main_ui_repaint_ms, measured_fps, mixer_meter_refresh_due, mixer_ui_repaint_ms,
+-        performance_pipeline_text, toggle_window_open, RuntimeFrameCounters,
++        performance_pipeline_text, prefer_selected_or_active_bgm, toggle_window_open,
++        RuntimeFrameCounters,
+     };
+     use std::time::{Duration, Instant};
+     use stream_capture::PreviewMode;
+@@ -3886,6 +3902,13 @@
+     }
+ 
+     #[test]
++    fn active_bgm_controls_remain_available_when_layer_selection_changes() {
++        assert_eq!(prefer_selected_or_active_bgm(Some(10_u64), Some(20_u64)), Some(10));
++        assert_eq!(prefer_selected_or_active_bgm(None, Some(20_u64)), Some(20));
++        assert_eq!(prefer_selected_or_active_bgm::<u64>(None, None), None);
++    }
++
++    #[test]
+     fn measured_fps_uses_actual_elapsed_time() {
+         let fps = measured_fps(45, 15, Duration::from_millis(1500));
+         assert!((fps - 20.0).abs() < 0.001);

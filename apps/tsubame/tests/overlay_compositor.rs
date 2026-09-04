@@ -1,4 +1,4 @@
-use yaoyorozu_stream::scene::OverlaySource;
+use tsubame_stream::scene::OverlaySource;
 
 #[test]
 fn disabled_overlay_does_not_change_frame() {

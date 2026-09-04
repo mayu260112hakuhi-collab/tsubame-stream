@@ -1,0 +1,16 @@
+--- a/apps/tsubame/src/app.rs
++++ b/apps/tsubame/src/app.rs
+@@ -3759,10 +3759,10 @@
+ #[cfg(test)]
+ mod toolbar_tests {
+     use super::{
+-        main_ui_repaint_ms, measured_fps, mixer_ui_repaint_ms, toggle_window_open,
+-        RuntimeFrameCounters,
++        main_ui_repaint_ms, measured_fps, mixer_meter_refresh_due, mixer_ui_repaint_ms,
++        performance_pipeline_text, toggle_window_open, RuntimeFrameCounters,
+     };
+-    use std::time::Duration;
++    use std::time::{Duration, Instant};
+     use stream_capture::PreviewMode;
+ 
+     #[test]

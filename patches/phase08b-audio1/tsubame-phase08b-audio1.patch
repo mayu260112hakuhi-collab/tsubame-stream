@@ -1,0 +1,759 @@
+--- a/apps/tsubame/src/app.rs
++++ b/apps/tsubame/src/app.rs
+@@ -22,8 +22,8 @@
+     time::{Duration, Instant},
+ };
+ use stream_audio::{
+-    application_source_label, dbfs, selection_label, AudioChannelKind, AudioDeviceSelection,
+-    AudioWorker, ChannelMixerControl, MixerControl,
++    application_source_label, dbfs, selection_label, AudioChannelId, AudioChannelKind,
++    AudioDeviceSelection, AudioWorker, ChannelMixerControl, ExternalPcmSender, MixerControl,
+ };
+ use stream_capture::{
+     enumerate_windows, CaptureSource, CaptureWorker, LatestFrameSnapshot, PreviewMode, WindowInfo,
+@@ -623,7 +623,7 @@
+ 
+ #[derive(Debug, Clone, Default)]
+ struct MixerRenderSnapshot {
+-    bgm_rows: Vec<(LayerId, String, f32, bool)>,
++    bgm_rows: Vec<(LayerId, Option<AudioChannelId>, String, f32, bool)>,
+     device_switch_enabled: bool,
+     device_switch_reason: Option<String>,
+ }
+@@ -1145,8 +1145,9 @@
+                 .find(|channel| channel.id == ChannelMixerControl::MICROPHONE_ID)
+                 .cloned();
+             let application_channels: Vec<_> = all_channels
+-                .into_iter()
++                .iter()
+                 .filter(|channel| channel.kind == AudioChannelKind::Application)
++                .cloned()
+                 .collect();
+ 
+             // Mixer stripには長いWASAPIステータス文字列をそのまま出さない。
+@@ -1248,18 +1249,29 @@
+                             }
+                         }
+ 
+-                        for (bgm_id, bgm_name, volume_percent, muted) in bgm_mixer_snapshot {
++                        for (bgm_id, audio_channel_id, bgm_name, volume_percent, muted)
++                            in bgm_mixer_snapshot
++                        {
++                            let bgm_channel = audio_channel_id.and_then(|channel_id| {
++                                all_channels.iter().find(|channel| channel.id == channel_id)
++                            });
+                             let bgm_strip = draw_mixer_channel_strip(
+                                 ui,
+                                 MixerStripModel {
+                                     title: "BGM".to_owned(),
+                                     source: bgm_name.clone(),
+-                                    // Phase 8AではPCMメーターはまだstream-audio未統合。
+-                                    // ストリップ構造を先に統一し、実レベルは8Bで接続する。
+-                                    level: 0.0,
++                                    level: audio_channel_id
++                                        .and_then(|channel_id| {
++                                            meter_snapshot
++                                                .application_levels
++                                                .get(&channel_id)
++                                                .copied()
++                                        })
++                                        .unwrap_or(0.0),
+                                     gain_percent: *volume_percent,
+                                     mute: Some(*muted),
+-                                    mix: None,
++                                    mix: bgm_channel.map(|channel| channel.include_in_stream_mix),
++                                    // 個別WAVはAudio.2で録画経路へ接続する。
+                                     wav: None,
+                                     removable: true,
+                                 },
+@@ -1270,6 +1282,13 @@
+                             if bgm_strip.mute != Some(*muted) {
+                                 if let Some(new_muted) = bgm_strip.mute {
+                                     bgm_mixer_mute_changes.push((*bgm_id, new_muted));
++                                }
++                            }
++                            if let Some(channel) = bgm_channel {
++                                if bgm_strip.mix != Some(channel.include_in_stream_mix) {
++                                    if let Some(in_mix) = bgm_strip.mix {
++                                        audio.set_channel_include_in_stream_mix(channel.id, in_mix);
++                                    }
+                                 }
+                             }
+                             if bgm_strip.remove_clicked {
+@@ -1523,7 +1542,7 @@
+         );
+     }
+ 
+-    ui.small("BGMのMix/WAVと実レベルメーターはPhase 8B-Audioで直接PCM統合します");
++    ui.small("BGMは48kHz stereo PCMで配信Mixへ直接接続 / 個別WAVはAudio.2で追加します");
+     if let Ok(state) = ui_state.lock() {
+         ui.small(&state.audio_message);
+     }
+@@ -1582,6 +1601,8 @@
+     image_library_message: String,
+     bgm_layers: Vec<(LayerId, BgmLayerSource)>,
+     bgm_players: HashMap<LayerId, BgmPlayer>,
++    bgm_pcm_senders: HashMap<LayerId, ExternalPcmSender>,
++    bgm_audio_channels: HashMap<LayerId, AudioChannelId>,
+     bgm_library_dir: PathBuf,
+     bgm_library_files: Vec<PathBuf>,
+     bgm_library_message: String,
+@@ -1655,6 +1676,23 @@
+         let id = self.allocate_layer_id();
+         self.layers
+             .push(SceneLayer::new(id, LayerKind::Audio, source.name.clone()));
++
++        if let Some(audio) = self.audio.as_ref() {
++            match audio.add_external_pcm_channel(format!("BGM: {}", source.name)) {
++                Ok(sender) => {
++                    let channel_id = sender.channel_id();
++                    audio.set_channel_gain(channel_id, source.volume_linear());
++                    audio.set_channel_muted(channel_id, source.muted);
++                    audio.set_channel_include_in_stream_mix(channel_id, true);
++                    self.bgm_audio_channels.insert(id, channel_id);
++                    self.bgm_pcm_senders.insert(id, sender);
++                }
++                Err(err) => {
++                    self.bgm_message = format!("BGM PCMチャンネル作成失敗: {err}");
++                }
++            }
++        }
++
+         self.bgm_layers.push((id, source));
+         id
+     }
+@@ -1662,6 +1700,14 @@
+     fn remove_bgm_layer(&mut self, id: LayerId) {
+         if let Some(player) = self.bgm_players.remove(&id) {
+             player.stop();
++        }
++        if let Some(sender) = self.bgm_pcm_senders.remove(&id) {
++            sender.clear_level();
++        }
++        if let Some(channel_id) = self.bgm_audio_channels.remove(&id) {
++            if let Some(audio) = self.audio.as_ref() {
++                audio.remove_audio_channel(channel_id);
++            }
+         }
+         self.layers.retain(|layer| layer.id != id);
+         self.bgm_layers.retain(|(layer_id, _)| *layer_id != id);
+@@ -1703,7 +1749,8 @@
+         let loop_enabled = source.loop_enabled;
+         let volume = source.effective_volume();
+         let name = source.name.clone();
+-        match BgmPlayer::play_file(&path, loop_enabled, volume) {
++        let pcm_sender = self.bgm_pcm_senders.get(&id).cloned();
++        match BgmPlayer::play_file(&path, loop_enabled, volume, pcm_sender) {
+             Ok(player) => {
+                 if let Some(old) = self.bgm_players.insert(id, player) {
+                     old.stop();
+@@ -1924,6 +1971,8 @@
+             image_library_message,
+             bgm_layers: Vec::new(),
+             bgm_players: HashMap::new(),
++            bgm_pcm_senders: HashMap::new(),
++            bgm_audio_channels: HashMap::new(),
+             bgm_library_dir,
+             bgm_library_files,
+             bgm_library_message,
+@@ -2259,6 +2308,7 @@
+                 .map(|(id, source)| {
+                     (
+                         *id,
++                        self.bgm_audio_channels.get(id).copied(),
+                         source.name.clone(),
+                         source.volume_percent,
+                         source.muted,
+@@ -2301,6 +2351,11 @@
+                         if let Some(player) = self.bgm_players.get(&layer_id) {
+                             player.set_volume(source.effective_volume());
+                         }
++                        if let Some(channel_id) = self.bgm_audio_channels.get(&layer_id).copied() {
++                            if let Some(audio) = self.audio.as_ref() {
++                                audio.set_channel_gain(channel_id, source.volume_linear());
++                            }
++                        }
+                     }
+                 }
+                 MixerViewportCommand::BgmMute { layer_id, muted } => {
+@@ -2312,6 +2367,11 @@
+                         source.muted = muted;
+                         if let Some(player) = self.bgm_players.get(&layer_id) {
+                             player.set_volume(source.effective_volume());
++                        }
++                        if let Some(channel_id) = self.bgm_audio_channels.get(&layer_id).copied() {
++                            if let Some(audio) = self.audio.as_ref() {
++                                audio.set_channel_muted(channel_id, muted);
++                            }
+                         }
+                     }
+                 }
+@@ -3594,8 +3654,24 @@
+                             if let Some(player) = self.bgm_players.get(&bgm_layer_id) {
+                                 player.set_volume(volume);
+                             }
++                            if let Some(channel_id) = self.bgm_audio_channels.get(&bgm_layer_id).copied() {
++                                if let Some((_, source)) = self
++                                    .bgm_layers
++                                    .iter()
++                                    .find(|(id, _)| *id == bgm_layer_id)
++                                {
++                                    if let Some(audio) = self.audio.as_ref() {
++                                        audio.set_channel_gain(channel_id, source.volume_linear());
++                                    }
++                                }
++                            }
+                         }
+                         if let Some(muted) = bgm_mute_change {
++                            if let Some(channel_id) = self.bgm_audio_channels.get(&bgm_layer_id).copied() {
++                                if let Some(audio) = self.audio.as_ref() {
++                                    audio.set_channel_muted(channel_id, muted);
++                                }
++                            }
+                             self.bgm_message = if muted {
+                                 "BGM: Mute ON".to_owned()
+                             } else {
+--- a/apps/tsubame/src/bgm.rs
++++ b/apps/tsubame/src/bgm.rs
+@@ -1,9 +1,11 @@
+-use rodio::{Decoder, OutputStream, Sink, Source};
++use rodio::{source::UniformSourceIterator, Decoder, OutputStream, Sink, Source};
+ use std::{
+     fs::File,
+     io::BufReader,
+     path::{Path, PathBuf},
++    time::Duration,
+ };
++use stream_audio::ExternalPcmSender;
+ 
+ #[derive(Debug, Clone)]
+ pub struct BgmLayerSource {
+@@ -44,14 +46,107 @@
+     }
+ }
+ 
++struct PcmTapSource<I>
++where
++    I: Source<Item = f32>,
++{
++    input: I,
++    sender: ExternalPcmSender,
++    chunk: Vec<f32>,
++    drained: bool,
++}
++
++impl<I> PcmTapSource<I>
++where
++    I: Source<Item = f32>,
++{
++    fn new(input: I, sender: ExternalPcmSender) -> Self {
++        Self {
++            input,
++            sender,
++            chunk: Vec::with_capacity(1_920), // 20 ms @ 48 kHz stereo
++            drained: false,
++        }
++    }
++
++    fn flush_chunk(&mut self, pad_to_20ms: bool) {
++        if self.chunk.is_empty() {
++            return;
++        }
++        if pad_to_20ms {
++            self.chunk.resize(1_920, 0.0);
++        }
++        self.sender.push_f32_stereo_48k(&self.chunk);
++        self.chunk.clear();
++    }
++}
++
++impl<I> Iterator for PcmTapSource<I>
++where
++    I: Source<Item = f32>,
++{
++    type Item = f32;
++
++    fn next(&mut self) -> Option<Self::Item> {
++        match self.input.next() {
++            Some(sample) => {
++                self.chunk.push(sample);
++                if self.chunk.len() >= 1_920 {
++                    self.flush_chunk(false);
++                }
++                Some(sample)
++            }
++            None => {
++                if !self.drained {
++                    self.flush_chunk(true);
++                    self.sender.clear_level();
++                    self.drained = true;
++                }
++                None
++            }
++        }
++    }
++
++    fn size_hint(&self) -> (usize, Option<usize>) {
++        self.input.size_hint()
++    }
++}
++
++impl<I> Source for PcmTapSource<I>
++where
++    I: Source<Item = f32>,
++{
++    fn current_frame_len(&self) -> Option<usize> {
++        self.input.current_frame_len()
++    }
++
++    fn channels(&self) -> u16 {
++        self.input.channels()
++    }
++
++    fn sample_rate(&self) -> u32 {
++        self.input.sample_rate()
++    }
++
++    fn total_duration(&self) -> Option<Duration> {
++        self.input.total_duration()
++    }
++}
++
+ pub struct BgmPlayer {
+     // OutputStream must stay alive while Sink is playing.
+     _stream: OutputStream,
+     sink: Sink,
++    pcm_sender: Option<ExternalPcmSender>,
+ }
+ 
+ impl BgmPlayer {
+-    pub fn play_file(path: &Path, loop_enabled: bool, volume: f32) -> Result<Self, String> {
++    pub fn play_file(
++        path: &Path,
++        loop_enabled: bool,
++        volume: f32,
++        pcm_sender: Option<ExternalPcmSender>,
++    ) -> Result<Self, String> {
+         let (stream, stream_handle) = OutputStream::try_default()
+             .map_err(|err| format!("BGM出力デバイスを開けませんでした: {err}"))?;
+         let sink = Sink::try_new(&stream_handle)
+@@ -63,9 +158,23 @@
+             .map_err(|err| format!("BGMをデコードできませんでした: {err}"))?;
+ 
+         if loop_enabled {
+-            sink.append(decoder.repeat_infinite());
++            let source = UniformSourceIterator::<_, f32>::new(
++                decoder.repeat_infinite().convert_samples::<f32>(),
++                2,
++                48_000,
++            );
++            if let Some(sender) = pcm_sender.clone() {
++                sink.append(PcmTapSource::new(source, sender));
++            } else {
++                sink.append(source);
++            }
+         } else {
+-            sink.append(decoder);
++            let source = UniformSourceIterator::<_, f32>::new(decoder.convert_samples::<f32>(), 2, 48_000);
++            if let Some(sender) = pcm_sender.clone() {
++                sink.append(PcmTapSource::new(source, sender));
++            } else {
++                sink.append(source);
++            }
+         }
+         sink.set_volume(volume.clamp(0.0, 1.0));
+         sink.play();
+@@ -73,11 +182,15 @@
+         Ok(Self {
+             _stream: stream,
+             sink,
++            pcm_sender,
+         })
+     }
+ 
+     pub fn pause(&self) {
+         self.sink.pause();
++        if let Some(sender) = &self.pcm_sender {
++            sender.clear_level();
++        }
+     }
+ 
+     pub fn resume(&self) {
+@@ -86,6 +199,9 @@
+ 
+     pub fn stop(&self) {
+         self.sink.stop();
++        if let Some(sender) = &self.pcm_sender {
++            sender.clear_level();
++        }
+     }
+ 
+     pub fn set_volume(&self, volume: f32) {
+--- a/crates/stream-audio/src/lib.rs
++++ b/crates/stream-audio/src/lib.rs
+@@ -15,6 +15,7 @@
+     net::UdpSocket,
+     sync::{
+         atomic::{AtomicBool, Ordering},
++        mpsc::{self, Receiver, SyncSender, TrySendError},
+         Arc, Mutex,
+     },
+     thread::{self, JoinHandle},
+@@ -251,6 +252,89 @@
+     }
+ }
+ 
++
++#[derive(Clone, Default)]
++struct ExternalPcmBus {
++    subscribers: Arc<Mutex<Vec<SyncSender<Arc<[u8]>>>>>,
++}
++
++impl ExternalPcmBus {
++    fn subscribe(&self) -> Receiver<Arc<[u8]>> {
++        let (tx, rx) = mpsc::sync_channel(8);
++        if let Ok(mut subscribers) = self.subscribers.lock() {
++            subscribers.push(tx);
++        }
++        rx
++    }
++
++    fn publish(&self, packet: Arc<[u8]>) {
++        if let Ok(mut subscribers) = self.subscribers.lock() {
++            subscribers.retain(|sender| match sender.try_send(Arc::clone(&packet)) {
++                Ok(()) => true,
++                Err(TrySendError::Full(_)) => true,
++                Err(TrySendError::Disconnected(_)) => false,
++            });
++        }
++    }
++}
++
++#[derive(Clone)]
++pub struct ExternalPcmSender {
++    channel_id: AudioChannelId,
++    bus: ExternalPcmBus,
++    mixer: ChannelMixerControl,
++}
++
++impl ExternalPcmSender {
++    pub fn channel_id(&self) -> AudioChannelId {
++        self.channel_id
++    }
++
++    /// Push raw 48 kHz stereo float samples. The producer may submit any
++    /// whole number of stereo frames; the live bridge forwards them as PCM16.
++    pub fn push_f32_stereo_48k(&self, samples: &[f32]) {
++        if samples.len() < 2 {
++            return;
++        }
++
++        let usable = samples.len() - (samples.len() % 2);
++        let mut peak = 0.0_f32;
++        let mut pcm = Vec::with_capacity(usable * 2);
++        for &sample in &samples[..usable] {
++            let sample = if sample.is_finite() {
++                sample.clamp(-1.0, 1.0)
++            } else {
++                0.0
++            };
++            peak = peak.max(sample.abs());
++            let encoded = if sample >= 0.0 {
++                (sample * i16::MAX as f32).round() as i16
++            } else {
++                (sample * -(i16::MIN as f32)).round() as i16
++            };
++            pcm.extend_from_slice(&encoded.to_le_bytes());
++        }
++
++        let adjusted = self
++            .mixer
++            .channel(self.channel_id)
++            .map(|channel| {
++                if channel.enabled && !channel.muted {
++                    peak * channel.gain.clamp(0.0, 1.0)
++                } else {
++                    0.0
++                }
++            })
++            .unwrap_or(0.0);
++        self.mixer.set_level(self.channel_id, adjusted);
++        self.bus.publish(Arc::<[u8]>::from(pcm));
++    }
++
++    pub fn clear_level(&self) {
++        self.mixer.set_level(self.channel_id, 0.0);
++    }
++}
++
+ #[derive(Debug, Clone, Copy, PartialEq)]
+ pub struct MixerSettings {
+     pub mic_gain: f32,
+@@ -510,6 +594,7 @@
+     output_devices: Arc<Mutex<Vec<AudioDeviceInfo>>>,
+     application_sources: Arc<Mutex<Vec<ApplicationAudioSource>>>,
+     application_captures: Mutex<HashMap<AudioChannelId, ApplicationCaptureWorker>>,
++    external_pcm_buses: Mutex<HashMap<AudioChannelId, ExternalPcmBus>>,
+     stop: Arc<AtomicBool>,
+     mic_thread: Option<JoinHandle<()>>,
+     desktop_thread: Option<JoinHandle<()>>,
+@@ -529,6 +614,7 @@
+                 Arc::new(Mutex::new(enumerate_output_devices().unwrap_or_default()));
+             let application_sources = Arc::new(Mutex::new(Vec::new()));
+             let application_captures = Mutex::new(HashMap::new());
++            let external_pcm_buses = Mutex::new(HashMap::new());
+             let stop = Arc::new(AtomicBool::new(false));
+ 
+             let mic_handle = {
+@@ -579,6 +665,7 @@
+                 output_devices,
+                 application_sources,
+                 application_captures,
++                external_pcm_buses,
+                 stop,
+                 mic_thread: Some(mic_handle),
+                 desktop_thread: Some(desktop_handle),
+@@ -604,7 +691,9 @@
+             .channel_mixer
+             .channels()
+             .into_iter()
+-            .filter(|channel| channel.kind == AudioChannelKind::Application)
++            .filter(|channel| {
++                matches!(channel.kind, AudioChannelKind::Application | AudioChannelKind::Custom)
++            })
+             .filter(|channel| channel.enabled && channel.include_in_stream_mix && !channel.muted)
+             .map(|channel| channel.current_level)
+             .sum();
+@@ -622,6 +711,32 @@
+     }
+     pub fn add_custom_channel(&self, name: impl Into<String>) -> AudioChannelId {
+         self.channel_mixer.add_channel(AudioChannel::custom(name))
++    }
++
++    pub fn add_external_pcm_channel(
++        &self,
++        name: impl Into<String>,
++    ) -> Result<ExternalPcmSender, AudioError> {
++        let id = self.channel_mixer.add_channel(AudioChannel::custom(name));
++        if id == 0 {
++            return Err(AudioError::Backend(
++                "外部PCMチャンネルを作成できませんでした".to_owned(),
++            ));
++        }
++        let bus = ExternalPcmBus::default();
++        if let Ok(mut buses) = self.external_pcm_buses.lock() {
++            buses.insert(id, bus.clone());
++        } else {
++            self.channel_mixer.remove_channel(id);
++            return Err(AudioError::Backend(
++                "外部PCMチャンネル状態を保存できませんでした".to_owned(),
++            ));
++        }
++        Ok(ExternalPcmSender {
++            channel_id: id,
++            bus,
++            mixer: self.channel_mixer.clone(),
++        })
+     }
+ 
+     pub fn application_sources(&self) -> Vec<ApplicationAudioSource> {
+@@ -713,6 +828,9 @@
+     }
+ 
+     pub fn remove_audio_channel(&self, id: AudioChannelId) -> bool {
++        if let Ok(mut buses) = self.external_pcm_buses.lock() {
++            buses.remove(&id);
++        }
+         if let Ok(mut captures) = self.application_captures.lock() {
+             if let Some(worker) = captures.remove(&id) {
+                 drop(captures);
+@@ -756,6 +874,9 @@
+             let stop = Arc::new(AtomicBool::new(false));
+             let mut inputs = Vec::new();
+             let mut threads: Vec<JoinHandle<Result<(), AudioError>>> = Vec::new();
++            let exclude_tsubame_from_desktop = channels
++                .iter()
++                .any(|channel| channel.enabled && channel.kind == AudioChannelKind::Custom);
+ 
+             let next_port = || -> Result<u16, AudioError> {
+                 let socket = UdpSocket::bind("127.0.0.1:0").map_err(|e| {
+@@ -787,13 +908,23 @@
+                             .name("yaoyorozu-live-desktop".to_owned())
+                             .spawn(move || {
+                                 std::thread::sleep(std::time::Duration::from_millis(300));
+-                                windows_pcm::stream_loopback_udp(
+-                                    port,
+-                                    thread_stop,
+-                                    selection,
+-                                    live_mixer,
+-                                    channel_id,
+-                                )
++                                if exclude_tsubame_from_desktop {
++                                    windows_pcm::stream_loopback_excluding_process_udp(
++                                        port,
++                                        thread_stop,
++                                        std::process::id(),
++                                        live_mixer,
++                                        channel_id,
++                                    )
++                                } else {
++                                    windows_pcm::stream_loopback_udp(
++                                        port,
++                                        thread_stop,
++                                        selection,
++                                        live_mixer,
++                                        channel_id,
++                                    )
++                                }
+                             })
+                     }
+                     AudioChannelKind::Microphone => {
+@@ -828,7 +959,28 @@
+                                 )
+                             })
+                     }
+-                    AudioChannelKind::Custom => continue,
++                    AudioChannelKind::Custom => {
++                        let bus = self
++                            .external_pcm_buses
++                            .lock()
++                            .ok()
++                            .and_then(|buses| buses.get(&channel_id).cloned());
++                        let Some(bus) = bus else {
++                            continue;
++                        };
++                        let receiver = bus.subscribe();
++                        thread::Builder::new()
++                            .name(format!("yaoyorozu-live-external-{channel_id}"))
++                            .spawn(move || {
++                                windows_pcm::stream_external_pcm_udp(
++                                    port,
++                                    thread_stop,
++                                    receiver,
++                                    live_mixer,
++                                    channel_id,
++                                )
++                            })
++                    },
+                 }
+                 .map_err(|e| AudioError::Backend(format!("{name} ライブ音声開始失敗: {e}")))?;
+ 
+@@ -1560,6 +1712,7 @@
+         path::Path,
+         sync::{
+             atomic::{AtomicBool, Ordering},
++            mpsc::{Receiver, RecvTimeoutError},
+             Arc,
+         },
+     };
+@@ -1726,6 +1879,67 @@
+         })();
+         deinitialize();
+         result
++    }
++
++    pub fn stream_loopback_excluding_process_udp(
++        port: u16,
++        stop: Arc<AtomicBool>,
++        process_id: u32,
++        mixer: ChannelMixerControl,
++        channel_id: AudioChannelId,
++    ) -> Result<(), AudioError> {
++        initialize_mta()
++            .ok()
++            .map_err(|e| AudioError::Backend(format!("COM初期化失敗: {e:?}")))?;
++        let result = (|| {
++            let mut client = AudioClient::new_application_loopback_client(process_id, false)
++                .map_err(|e| AudioError::Backend(format!("desktop-live exclude-self client: {e}")))?;
++            stream_application_client_udp(
++                &mut client,
++                port,
++                stop,
++                "desktop-live-excluding-tsubame",
++                mixer,
++                channel_id,
++            )
++        })();
++        deinitialize();
++        result
++    }
++
++    pub fn stream_external_pcm_udp(
++        port: u16,
++        stop: Arc<AtomicBool>,
++        receiver: Receiver<Arc<[u8]>>,
++        mixer: ChannelMixerControl,
++        channel_id: AudioChannelId,
++    ) -> Result<(), AudioError> {
++        let socket = UdpSocket::bind("127.0.0.1:0")
++            .map_err(|e| AudioError::Backend(format!("external-live UDP bind: {e}")))?;
++        socket
++            .connect(("127.0.0.1", port))
++            .map_err(|e| AudioError::Backend(format!("external-live UDP connect: {e}")))?;
++
++        while !stop.load(Ordering::Relaxed) {
++            match receiver.recv_timeout(std::time::Duration::from_millis(20)) {
++                Ok(packet) => {
++                    let mut bytes = packet.to_vec();
++                    apply_live_channel_control(&mut bytes, &mixer, channel_id);
++                    if bytes.is_empty() {
++                        send_silence(&socket)?;
++                    } else {
++                        send_pcm_chunks(&socket, &bytes)?;
++                    }
++                }
++                Err(RecvTimeoutError::Timeout) => {
++                    send_silence(&socket)?;
++                }
++                Err(RecvTimeoutError::Disconnected) => {
++                    send_silence(&socket)?;
++                }
++            }
++        }
++        Ok(())
+     }
+ 
+     pub fn stream_loopback_udp(
+@@ -2283,3 +2497,42 @@
+         Ok(())
+     }
+ }
++
++
++#[cfg(test)]
++mod external_pcm_tests {
++    use super::*;
++
++    #[test]
++    fn external_pcm_sender_updates_channel_meter() {
++        let mixer = ChannelMixerControl::default();
++        let channel_id = mixer.add_channel(AudioChannel::custom("BGM"));
++        let bus = ExternalPcmBus::default();
++        let sender = ExternalPcmSender {
++            channel_id,
++            bus,
++            mixer: mixer.clone(),
++        };
++        sender.push_f32_stereo_48k(&[0.5, -0.5, 0.25, -0.25]);
++        let level = mixer.channel(channel_id).unwrap().current_level;
++        assert!((level - 0.5).abs() < 0.001);
++    }
++
++    #[test]
++    fn external_pcm_bus_broadcasts_pcm16_packet() {
++        let mixer = ChannelMixerControl::default();
++        let channel_id = mixer.add_channel(AudioChannel::custom("BGM"));
++        let bus = ExternalPcmBus::default();
++        let receiver = bus.subscribe();
++        let sender = ExternalPcmSender {
++            channel_id,
++            bus,
++            mixer,
++        };
++        sender.push_f32_stereo_48k(&[1.0, -1.0]);
++        let packet = receiver.recv_timeout(std::time::Duration::from_millis(50)).unwrap();
++        assert_eq!(packet.len(), 4);
++        assert_eq!(i16::from_le_bytes([packet[0], packet[1]]), i16::MAX);
++        assert_eq!(i16::from_le_bytes([packet[2], packet[3]]), i16::MIN);
++    }
++}

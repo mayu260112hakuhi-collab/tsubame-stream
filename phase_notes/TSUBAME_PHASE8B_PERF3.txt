@@ -1,0 +1,6 @@
+燕 / Tsubame Phase 8B-Perf.3
+実測パフォーマンス表示
+
+Base: Phase 8B-Perf.2.1
+Changed: apps/tsubame/src/app.rs
+Patch: patches/phase08b-perf3/tsubame-runtime-fps-phase08b-perf3.patch

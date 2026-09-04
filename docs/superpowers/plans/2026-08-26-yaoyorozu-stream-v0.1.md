@@ -51,7 +51,7 @@
 **Interfaces:**
 - Produces: `MarkerKind::{Cut,Short,Chapter,Note}`, `EditMarker`, `EditManifest::to_json_pretty()`.
 
-- [ ] **Step 1: Write failing tests** asserting marker millisecond timestamps and `format="yaoyorozu_stream_edit"`, `version=1`.
+- [ ] **Step 1: Write failing tests** asserting marker millisecond timestamps and `format="tsubame_stream_edit"`, `version=1`.
 - [ ] **Step 2: Run** `cargo test -p stream-core --test edit_json` and verify RED.
 - [ ] **Step 3: Implement** marker and manifest serialization using relative media paths.
 - [ ] **Step 4: Run** the test and full `cargo test -p stream-core`; verify GREEN.

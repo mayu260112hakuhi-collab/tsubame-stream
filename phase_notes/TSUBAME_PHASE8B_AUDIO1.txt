@@ -1,0 +1,22 @@
+Phase 8B-Audio.1
+BGM direct PCM streaming foundation
+
+Changed:
+- apps/tsubame/src/app.rs
+- apps/tsubame/src/bgm.rs
+- crates/stream-audio/src/lib.rs
+
+Test on Windows:
+  cargo test -p stream-audio external_pcm_sender_updates_channel_meter
+  cargo test -p stream-audio external_pcm_bus_broadcasts_pcm16_packet
+  cargo test --workspace
+  cargo build --release -p tsubame-stream
+
+Manual check:
+1. Add BGM before starting stream.
+2. Start BGM and confirm BGM meter moves.
+3. PC音声 Mix OFF / BGM Mix ON -> stream should still receive BGM.
+4. BGM Mix OFF -> BGM should disappear from stream while local monitor keeps playing.
+5. BGM Mute ON -> BGM meter becomes 0 and stream BGM becomes silent.
+
+Audio.2 will add individual WAV and recording/final-mux integration.

@@ -1,5 +1,5 @@
 use stream_core::{MarkerKind, StreamPreset};
-use yaoyorozu_stream::view_model::StreamViewModel;
+use tsubame_stream::view_model::StreamViewModel;
 
 #[test]
 fn compact_ui_model_defaults_to_game_and_exposes_post_stream_bridge() {

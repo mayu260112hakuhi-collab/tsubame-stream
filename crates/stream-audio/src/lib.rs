@@ -15,6 +15,7 @@ use std::{
     net::UdpSocket,
     sync::{
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, SyncSender, TrySendError},
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
@@ -248,6 +249,104 @@ impl ChannelMixerControl {
         if let Ok(mut state) = self.inner.lock() {
             state.master_gain = gain.clamp(0.0, 1.0);
         }
+    }
+}
+
+
+#[derive(Clone, Default)]
+struct ExternalPcmBus {
+    subscribers: Arc<Mutex<Vec<SyncSender<Arc<[u8]>>>>>,
+}
+
+impl ExternalPcmBus {
+    fn subscribe(&self) -> Receiver<Arc<[u8]>> {
+        let (tx, rx) = mpsc::sync_channel(8);
+        if let Ok(mut subscribers) = self.subscribers.lock() {
+            subscribers.push(tx);
+        }
+        rx
+    }
+
+    fn publish(&self, packet: Arc<[u8]>) {
+        if let Ok(mut subscribers) = self.subscribers.lock() {
+            subscribers.retain(|sender| match sender.try_send(Arc::clone(&packet)) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => true,
+                Err(TrySendError::Disconnected(_)) => false,
+            });
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ExternalPcmSender {
+    channel_id: AudioChannelId,
+    bus: ExternalPcmBus,
+    mixer: ChannelMixerControl,
+}
+
+impl ExternalPcmSender {
+    pub fn channel_id(&self) -> AudioChannelId {
+        self.channel_id
+    }
+
+    /// Push raw 48 kHz stereo float samples. The producer may submit any
+    /// whole number of stereo frames; the live bridge forwards them as PCM16.
+    pub fn push_f32_stereo_48k(&self, samples: &[f32]) {
+        if samples.len() < 2 {
+            return;
+        }
+
+        let usable = samples.len() - (samples.len() % 2);
+        let mut peak = 0.0_f32;
+        let mut pcm = Vec::with_capacity(usable * 2);
+        for &sample in &samples[..usable] {
+            let sample = if sample.is_finite() {
+                sample.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+            peak = peak.max(sample.abs());
+            let encoded = if sample >= 0.0 {
+                (sample * i16::MAX as f32).round() as i16
+            } else {
+                (sample * -(i16::MIN as f32)).round() as i16
+            };
+            pcm.extend_from_slice(&encoded.to_le_bytes());
+        }
+
+        let adjusted = self
+            .mixer
+            .channel(self.channel_id)
+            .map(|channel| {
+                if channel.enabled && !channel.muted {
+                    peak * channel.gain.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            })
+            .unwrap_or(0.0);
+        self.mixer.set_level(self.channel_id, adjusted);
+        self.bus.publish(Arc::<[u8]>::from(pcm));
+    }
+
+    pub fn clear_level(&self) {
+        self.mixer.set_level(self.channel_id, 0.0);
+    }
+}
+
+pub struct ExternalPcmRecordingSource {
+    channel_id: AudioChannelId,
+    receiver: Receiver<Arc<[u8]>>,
+}
+
+impl ExternalPcmRecordingSource {
+    pub fn channel_id(&self) -> AudioChannelId {
+        self.channel_id
+    }
+
+    pub fn into_receiver(self) -> Receiver<Arc<[u8]>> {
+        self.receiver
     }
 }
 
@@ -510,6 +609,7 @@ pub struct AudioWorker {
     output_devices: Arc<Mutex<Vec<AudioDeviceInfo>>>,
     application_sources: Arc<Mutex<Vec<ApplicationAudioSource>>>,
     application_captures: Mutex<HashMap<AudioChannelId, ApplicationCaptureWorker>>,
+    external_pcm_buses: Mutex<HashMap<AudioChannelId, ExternalPcmBus>>,
     stop: Arc<AtomicBool>,
     mic_thread: Option<JoinHandle<()>>,
     desktop_thread: Option<JoinHandle<()>>,
@@ -529,6 +629,7 @@ impl AudioWorker {
                 Arc::new(Mutex::new(enumerate_output_devices().unwrap_or_default()));
             let application_sources = Arc::new(Mutex::new(Vec::new()));
             let application_captures = Mutex::new(HashMap::new());
+            let external_pcm_buses = Mutex::new(HashMap::new());
             let stop = Arc::new(AtomicBool::new(false));
 
             let mic_handle = {
@@ -579,6 +680,7 @@ impl AudioWorker {
                 output_devices,
                 application_sources,
                 application_captures,
+                external_pcm_buses,
                 stop,
                 mic_thread: Some(mic_handle),
                 desktop_thread: Some(desktop_handle),
@@ -604,7 +706,9 @@ impl AudioWorker {
             .channel_mixer
             .channels()
             .into_iter()
-            .filter(|channel| channel.kind == AudioChannelKind::Application)
+            .filter(|channel| {
+                matches!(channel.kind, AudioChannelKind::Application | AudioChannelKind::Custom)
+            })
             .filter(|channel| channel.enabled && channel.include_in_stream_mix && !channel.muted)
             .map(|channel| channel.current_level)
             .sum();
@@ -622,6 +726,47 @@ impl AudioWorker {
     }
     pub fn add_custom_channel(&self, name: impl Into<String>) -> AudioChannelId {
         self.channel_mixer.add_channel(AudioChannel::custom(name))
+    }
+
+    pub fn add_external_pcm_channel(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<ExternalPcmSender, AudioError> {
+        let id = self.channel_mixer.add_channel(AudioChannel::custom(name));
+        if id == 0 {
+            return Err(AudioError::Backend(
+                "外部PCMチャンネルを作成できませんでした".to_owned(),
+            ));
+        }
+        let bus = ExternalPcmBus::default();
+        if let Ok(mut buses) = self.external_pcm_buses.lock() {
+            buses.insert(id, bus.clone());
+        } else {
+            self.channel_mixer.remove_channel(id);
+            return Err(AudioError::Backend(
+                "外部PCMチャンネル状態を保存できませんでした".to_owned(),
+            ));
+        }
+        Ok(ExternalPcmSender {
+            channel_id: id,
+            bus,
+            mixer: self.channel_mixer.clone(),
+        })
+    }
+
+    pub fn external_pcm_recording_sources(&self) -> Vec<ExternalPcmRecordingSource> {
+        self.external_pcm_buses
+            .lock()
+            .map(|buses| {
+                buses
+                    .iter()
+                    .map(|(&channel_id, bus)| ExternalPcmRecordingSource {
+                        channel_id,
+                        receiver: bus.subscribe(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub fn application_sources(&self) -> Vec<ApplicationAudioSource> {
@@ -713,6 +858,9 @@ impl AudioWorker {
     }
 
     pub fn remove_audio_channel(&self, id: AudioChannelId) -> bool {
+        if let Ok(mut buses) = self.external_pcm_buses.lock() {
+            buses.remove(&id);
+        }
         if let Ok(mut captures) = self.application_captures.lock() {
             if let Some(worker) = captures.remove(&id) {
                 drop(captures);
@@ -756,6 +904,9 @@ impl AudioWorker {
             let stop = Arc::new(AtomicBool::new(false));
             let mut inputs = Vec::new();
             let mut threads: Vec<JoinHandle<Result<(), AudioError>>> = Vec::new();
+            let exclude_tsubame_from_desktop = channels
+                .iter()
+                .any(|channel| channel.enabled && channel.kind == AudioChannelKind::Custom);
 
             let next_port = || -> Result<u16, AudioError> {
                 let socket = UdpSocket::bind("127.0.0.1:0").map_err(|e| {
@@ -787,13 +938,23 @@ impl AudioWorker {
                             .name("yaoyorozu-live-desktop".to_owned())
                             .spawn(move || {
                                 std::thread::sleep(std::time::Duration::from_millis(300));
-                                windows_pcm::stream_loopback_udp(
-                                    port,
-                                    thread_stop,
-                                    selection,
-                                    live_mixer,
-                                    channel_id,
-                                )
+                                if exclude_tsubame_from_desktop {
+                                    windows_pcm::stream_loopback_excluding_process_udp(
+                                        port,
+                                        thread_stop,
+                                        std::process::id(),
+                                        live_mixer,
+                                        channel_id,
+                                    )
+                                } else {
+                                    windows_pcm::stream_loopback_udp(
+                                        port,
+                                        thread_stop,
+                                        selection,
+                                        live_mixer,
+                                        channel_id,
+                                    )
+                                }
                             })
                     }
                     AudioChannelKind::Microphone => {
@@ -828,7 +989,28 @@ impl AudioWorker {
                                 )
                             })
                     }
-                    AudioChannelKind::Custom => continue,
+                    AudioChannelKind::Custom => {
+                        let bus = self
+                            .external_pcm_buses
+                            .lock()
+                            .ok()
+                            .and_then(|buses| buses.get(&channel_id).cloned());
+                        let Some(bus) = bus else {
+                            continue;
+                        };
+                        let receiver = bus.subscribe();
+                        thread::Builder::new()
+                            .name(format!("yaoyorozu-live-external-{channel_id}"))
+                            .spawn(move || {
+                                windows_pcm::stream_external_pcm_udp(
+                                    port,
+                                    thread_stop,
+                                    receiver,
+                                    live_mixer,
+                                    channel_id,
+                                )
+                            })
+                    },
                 }
                 .map_err(|e| AudioError::Backend(format!("{name} ライブ音声開始失敗: {e}")))?;
 
@@ -1427,11 +1609,17 @@ pub struct ApplicationRecordingPath {
     pub path: std::path::PathBuf,
 }
 
-#[derive(Debug, Clone)]
+pub struct ExternalPcmRecordingPath {
+    pub channel_id: AudioChannelId,
+    pub path: std::path::PathBuf,
+    pub source: ExternalPcmRecordingSource,
+}
+
 pub struct AudioRecordingPaths {
     pub microphone: std::path::PathBuf,
     pub desktop: std::path::PathBuf,
     pub applications: Vec<ApplicationRecordingPath>,
+    pub external: Vec<ExternalPcmRecordingPath>,
 }
 
 pub struct PcmRecordingWorker {
@@ -1439,6 +1627,11 @@ pub struct PcmRecordingWorker {
     mic_thread: Option<JoinHandle<Result<(), AudioError>>>,
     desktop_thread: Option<JoinHandle<Result<(), AudioError>>>,
     application_threads: Vec<(AudioChannelId, JoinHandle<Result<(), AudioError>>)>,
+    external_threads: Vec<(AudioChannelId, JoinHandle<Result<(), AudioError>>)>,
+}
+
+fn should_exclude_tsubame_from_desktop_recording(external_track_count: usize) -> bool {
+    external_track_count > 0
 }
 
 impl PcmRecordingWorker {
@@ -1453,6 +1646,8 @@ impl PcmRecordingWorker {
         #[cfg(windows)]
         {
             let stop = Arc::new(AtomicBool::new(false));
+            let exclude_tsubame_from_desktop =
+                should_exclude_tsubame_from_desktop_recording(paths.external.len());
 
             let mic_stop = Arc::clone(&stop);
             let mic_path = paths.microphone;
@@ -1468,7 +1663,19 @@ impl PcmRecordingWorker {
             let desktop_thread = thread::Builder::new()
                 .name("yaoyorozu-desktop-recorder".to_owned())
                 .spawn(move || {
-                    windows_pcm::record_loopback(&desktop_path, desktop_stop, desktop_selection)
+                    if exclude_tsubame_from_desktop {
+                        windows_pcm::record_loopback_excluding_process(
+                            &desktop_path,
+                            desktop_stop,
+                            std::process::id(),
+                        )
+                    } else {
+                        windows_pcm::record_loopback(
+                            &desktop_path,
+                            desktop_stop,
+                            desktop_selection,
+                        )
+                    }
                 })
                 .map_err(|e| AudioError::Backend(e.to_string()))?;
 
@@ -1500,11 +1707,46 @@ impl PcmRecordingWorker {
                 application_threads.push((channel_id, handle));
             }
 
+            let mut external_threads: Vec<(AudioChannelId, JoinHandle<Result<(), AudioError>>)> =
+                Vec::new();
+            for external in paths.external {
+                let external_stop = Arc::clone(&stop);
+                let channel_id = external.channel_id;
+                let path = external.path;
+                let receiver = external.source.into_receiver();
+                let handle = match thread::Builder::new()
+                    .name(format!("yaoyorozu-external-recorder-{channel_id}"))
+                    .spawn(move || {
+                        windows_pcm::record_external_pcm(
+                            &path,
+                            external_stop,
+                            receiver,
+                            channel_id,
+                        )
+                    }) {
+                    Ok(handle) => handle,
+                    Err(err) => {
+                        stop.store(true, Ordering::Relaxed);
+                        let _ = mic_thread.join();
+                        let _ = desktop_thread.join();
+                        for (_, handle) in application_threads {
+                            let _ = handle.join();
+                        }
+                        for (_, handle) in external_threads {
+                            let _ = handle.join();
+                        }
+                        return Err(AudioError::Backend(err.to_string()));
+                    }
+                };
+                external_threads.push((channel_id, handle));
+            }
+
             Ok(Self {
                 stop,
                 mic_thread: Some(mic_thread),
                 desktop_thread: Some(desktop_thread),
                 application_threads,
+                external_threads,
             })
         }
 
@@ -1546,6 +1788,17 @@ impl PcmRecordingWorker {
             let _ = handle.join();
         }
 
+        for (_channel_id, handle) in self.external_threads.drain(..) {
+            match handle.join() {
+                Ok(result) => result?,
+                Err(_) => {
+                    return Err(AudioError::Backend(
+                        "外部PCM録音スレッドがpanicしました".to_owned(),
+                    ))
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -1560,6 +1813,7 @@ mod windows_pcm {
         path::Path,
         sync::{
             atomic::{AtomicBool, Ordering},
+            mpsc::{Receiver, RecvTimeoutError},
             Arc,
         },
     };
@@ -1726,6 +1980,67 @@ mod windows_pcm {
         })();
         deinitialize();
         result
+    }
+
+    pub fn stream_loopback_excluding_process_udp(
+        port: u16,
+        stop: Arc<AtomicBool>,
+        process_id: u32,
+        mixer: ChannelMixerControl,
+        channel_id: AudioChannelId,
+    ) -> Result<(), AudioError> {
+        initialize_mta()
+            .ok()
+            .map_err(|e| AudioError::Backend(format!("COM初期化失敗: {e:?}")))?;
+        let result = (|| {
+            let mut client = AudioClient::new_application_loopback_client(process_id, false)
+                .map_err(|e| AudioError::Backend(format!("desktop-live exclude-self client: {e}")))?;
+            stream_application_client_udp(
+                &mut client,
+                port,
+                stop,
+                "desktop-live-excluding-tsubame",
+                mixer,
+                channel_id,
+            )
+        })();
+        deinitialize();
+        result
+    }
+
+    pub fn stream_external_pcm_udp(
+        port: u16,
+        stop: Arc<AtomicBool>,
+        receiver: Receiver<Arc<[u8]>>,
+        mixer: ChannelMixerControl,
+        channel_id: AudioChannelId,
+    ) -> Result<(), AudioError> {
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .map_err(|e| AudioError::Backend(format!("external-live UDP bind: {e}")))?;
+        socket
+            .connect(("127.0.0.1", port))
+            .map_err(|e| AudioError::Backend(format!("external-live UDP connect: {e}")))?;
+
+        while !stop.load(Ordering::Relaxed) {
+            match receiver.recv_timeout(std::time::Duration::from_millis(20)) {
+                Ok(packet) => {
+                    let mut bytes = packet.to_vec();
+                    apply_live_channel_control(&mut bytes, &mixer, channel_id);
+                    if bytes.is_empty() {
+                        send_silence(&socket)?;
+                    } else {
+                        send_pcm_chunks(&socket, &bytes)?;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    send_silence(&socket)?;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    send_silence(&socket)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn stream_loopback_udp(
@@ -2009,6 +2324,94 @@ mod windows_pcm {
         result
     }
 
+    pub fn record_loopback_excluding_process(
+        path: &Path,
+        stop: Arc<AtomicBool>,
+        process_id: u32,
+    ) -> Result<(), AudioError> {
+        initialize_mta()
+            .ok()
+            .map_err(|e| AudioError::Backend(format!("COM初期化失敗: {e:?}")))?;
+
+        let result = (|| {
+            let mut client = AudioClient::new_application_loopback_client(process_id, false)
+                .map_err(|e| AudioError::Backend(format!("desktop exclude-self client: {e}")))?;
+            record_application_client(&mut client, path, stop, "desktop-excluding-tsubame")
+        })();
+
+        deinitialize();
+        result
+    }
+
+    pub fn record_external_pcm(
+        path: &Path,
+        stop: Arc<AtomicBool>,
+        receiver: Receiver<Arc<[u8]>>,
+        channel_id: AudioChannelId,
+    ) -> Result<(), AudioError> {
+        const PACKET_SAMPLES: usize = 1_920; // 20 ms @ 48 kHz stereo
+        let mut writer =
+            WavWriter::create(path, wav_spec()).map_err(|e| AudioError::Backend(e.to_string()))?;
+        let mut total_samples = 0_u64;
+        let mut max_peak = 0.0_f32;
+
+        while !stop.load(Ordering::Relaxed) {
+            let packet = match receiver.recv_timeout(std::time::Duration::from_millis(20)) {
+                Ok(packet) => Some(packet),
+                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => None,
+            };
+
+            if let Some(packet) = packet {
+                let bytes = packet.as_ref();
+                let usable = bytes.len() - (bytes.len() % 2);
+                for chunk in bytes[..usable].chunks_exact(2) {
+                    let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
+                    max_peak = max_peak.max(
+                        (sample as f32 / i16::MAX as f32)
+                            .abs()
+                            .clamp(0.0, 1.0),
+                    );
+                    writer
+                        .write_sample(sample)
+                        .map_err(|e| AudioError::Backend(e.to_string()))?;
+                    total_samples += 1;
+                }
+            } else {
+                for _ in 0..PACKET_SAMPLES {
+                    writer
+                        .write_sample(0_i16)
+                        .map_err(|e| AudioError::Backend(e.to_string()))?;
+                }
+                total_samples += PACKET_SAMPLES as u64;
+            }
+        }
+
+        writer
+            .finalize()
+            .map_err(|e| AudioError::Backend(e.to_string()))?;
+
+        let track_name = format!("external-{channel_id}");
+        let duration_seconds = total_samples as f64 / CHANNELS as f64 / SAMPLE_RATE as f64;
+        let peak_db = if max_peak <= 0.000_001 {
+            -120.0
+        } else {
+            20.0 * (max_peak as f64).log10()
+        };
+        let debug = format!(
+            "track={track_name}\n\
+             sample_rate={SAMPLE_RATE}\n\
+             channels={CHANNELS}\n\
+             format=pcm_s16le\n\
+             samples={total_samples}\n\
+             duration_seconds={duration_seconds:.3}\n\
+             peak={max_peak:.8}\n\
+             peak_dbfs={peak_db:.2}\n"
+        );
+        std::fs::write(path.with_extension("audio.txt"), debug)
+            .map_err(|e| AudioError::Backend(format!("{track_name}: debug write: {e}")))?;
+        Ok(())
+    }
+
     pub fn record_application_loopback(
         path: &Path,
         stop: Arc<AtomicBool>,
@@ -2281,5 +2684,76 @@ mod windows_pcm {
             .map_err(|e| AudioError::Backend(format!("{track_name}: debug write: {e}")))?;
 
         Ok(())
+    }
+}
+
+
+#[cfg(test)]
+mod external_pcm_tests {
+    use super::*;
+
+    #[test]
+    fn desktop_recording_excludes_tsubame_when_external_pcm_is_recorded() {
+        assert!(should_exclude_tsubame_from_desktop_recording(1));
+    }
+
+    #[test]
+    fn desktop_recording_keeps_normal_loopback_without_external_pcm() {
+        assert!(!should_exclude_tsubame_from_desktop_recording(0));
+    }
+
+    #[test]
+    fn external_pcm_sender_updates_channel_meter() {
+        let mixer = ChannelMixerControl::default();
+        let channel_id = mixer.add_channel(AudioChannel::custom("BGM"));
+        let bus = ExternalPcmBus::default();
+        let sender = ExternalPcmSender {
+            channel_id,
+            bus,
+            mixer: mixer.clone(),
+        };
+        sender.push_f32_stereo_48k(&[0.5, -0.5, 0.25, -0.25]);
+        let level = mixer.channel(channel_id).unwrap().current_level;
+        assert!((level - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn external_pcm_recording_source_subscribes_to_same_raw_bus() {
+        let mixer = ChannelMixerControl::default();
+        let channel_id = mixer.add_channel(AudioChannel::custom("BGM"));
+        let bus = ExternalPcmBus::default();
+        let sender = ExternalPcmSender {
+            channel_id,
+            bus: bus.clone(),
+            mixer,
+        };
+        let source = ExternalPcmRecordingSource {
+            channel_id,
+            receiver: bus.subscribe(),
+        };
+        sender.push_f32_stereo_48k(&[0.5, -0.5]);
+        let packet = source
+            .into_receiver()
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .expect("recording subscriber should receive raw PCM");
+        assert_eq!(packet.len(), 4);
+    }
+
+    #[test]
+    fn external_pcm_bus_broadcasts_pcm16_packet() {
+        let mixer = ChannelMixerControl::default();
+        let channel_id = mixer.add_channel(AudioChannel::custom("BGM"));
+        let bus = ExternalPcmBus::default();
+        let receiver = bus.subscribe();
+        let sender = ExternalPcmSender {
+            channel_id,
+            bus,
+            mixer,
+        };
+        sender.push_f32_stereo_48k(&[1.0, -1.0]);
+        let packet = receiver.recv_timeout(std::time::Duration::from_millis(50)).unwrap();
+        assert_eq!(packet.len(), 4);
+        assert_eq!(i16::from_le_bytes([packet[0], packet[1]]), i16::MAX);
+        assert_eq!(i16::from_le_bytes([packet[2], packet[3]]), i16::MIN);
     }
 }
